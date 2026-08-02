@@ -1,0 +1,347 @@
+{
+	"name": "goldjolli-vscode",
+	"displayName": "GoldJolli",
+	"description": "GoldJolli VS Code extension — full Jolli Memory experience with local-fork privacy controls",
+	"version": "0.99.9",
+	"publisher": "goldjolli",
+	"license": "Apache-2.0",
+	"icon": "assets/icon.png",
+	"homepage": "https://github.com/jolliai/jolliai/tree/main/goldjolli-vscode#readme",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/jolliai/jolliai"
+	},
+	"bugs": {
+		"url": "https://github.com/jolliai/jolliai/issues"
+	},
+	"keywords": [
+		"ai",
+		"documentation",
+		"git",
+		"commit",
+		"memory",
+		"claude",
+		"codex",
+		"gemini",
+		"opencode",
+		"cursor",
+		"copilot",
+		"pr",
+		"summary"
+	],
+	"engines": {
+		"vscode": "^1.80.0"
+	},
+	"categories": [
+		"AI",
+		"SCM Providers",
+		"Other"
+	],
+	"activationEvents": [
+		"workspaceContains:.git",
+		"onUri"
+	],
+	"main": "./dist/Extension.js",
+	"contributes": {
+		"submenus": [
+			{
+				"id": "jollimemory.addMenu",
+				"label": "Add Plan or Note",
+				"icon": "$(add)"
+			}
+		],
+		"viewsContainers": {
+			"activitybar": [
+				{
+					"id": "jollimemory",
+					"title": "Jolli Memory",
+					"icon": "assets/icon.svg"
+				}
+			]
+		},
+		"views": {
+			"jollimemory": [
+				{
+					"id": "jollimemory.mainView",
+					"name": "Jolli Memory",
+					"type": "webview",
+					"icon": "assets/icon.svg"
+				}
+			]
+		},
+		"commands": [
+			{
+				"command": "jollimemory.refreshStatus",
+				"title": "Refresh Status",
+				"icon": "$(refresh)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.refreshMemories",
+				"title": "Refresh Memories",
+				"icon": "$(refresh)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.searchMemories",
+				"title": "Search Memories",
+				"icon": "$(search)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.clearMemoryFilter",
+				"title": "Clear Filter",
+				"icon": "$(close)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.loadMoreMemories",
+				"title": "Load More Memories",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.enableJolliMemory",
+				"title": "Enable Jolli Memory",
+				"icon": "$(circle-filled)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.disableJolliMemory",
+				"title": "Disable Jolli Memory",
+				"icon": "$(circle-slash)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.selectAllFiles",
+				"title": "Select/Deselect All Files",
+				"icon": "$(check-all)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.commitAI",
+				"title": "AI Commit",
+				"icon": "$(sparkle)",
+				"category": "Jolli Memory",
+				"enablement": "!jollimemory.workerBusy"
+			},
+			{
+				"command": "jollimemory.openSettings",
+				"title": "Settings",
+				"icon": "$(gear)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.toggleStatus",
+				"title": "Status",
+				"icon": "$(pulse)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.refreshFiles",
+				"title": "Refresh Files",
+				"icon": "$(refresh)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.discardSelectedChanges",
+				"title": "Discard Selected Changes",
+				"icon": "$(discard)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.selectAllCommits",
+				"title": "Select/Deselect All Commits",
+				"icon": "$(check-all)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.squash",
+				"title": "Squash Selected",
+				"icon": "$(git-merge)",
+				"category": "Jolli Memory",
+				"enablement": "!jollimemory.workerBusy"
+			},
+			{
+				"command": "jollimemory.pushBranch",
+				"title": "Push",
+				"icon": "$(cloud-upload)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.refreshHistory",
+				"title": "Refresh History",
+				"icon": "$(refresh)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.refreshPlans",
+				"title": "Refresh Plans",
+				"icon": "$(refresh)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.addPlan",
+				"title": "Add Plan",
+				"icon": "$(file-text)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.addMarkdownNote",
+				"title": "Add Markdown File",
+				"icon": "$(note)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.addTextSnippet",
+				"title": "Add Text Snippet",
+				"icon": "$(comment)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.openReferenceInBrowser",
+				"title": "Open Reference in Browser",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.openReferenceMarkdown",
+				"title": "Open Reference Markdown",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.ignoreReference",
+				"title": "Remove Reference",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.signIn",
+				"title": "Sign In to Jolli",
+				"icon": "$(sign-in)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.signOut",
+				"title": "Sign Out of Jolli",
+				"icon": "$(sign-out)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.revertMemoryFileEdits",
+				"title": "Memory Bank: Revert Edits to System Version"
+			},
+			{
+				"command": "jollimemory.syncNow",
+				"title": "Sync Memory Bank Now",
+				"icon": "$(sync)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.compileNow",
+				"title": "Build Knowledge Wiki",
+				"icon": "$(database)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.viewKnowledgeGraph",
+				"title": "View Knowledge Graph",
+				"icon": "$(type-hierarchy)",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.reviewNextMemory",
+				"title": "Jolli Memory: Review Next Memory",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.regenerateNextMemoryTitle",
+				"title": "Jolli Memory: Regenerate Next Memory Title",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.shareBranch",
+				"title": "Jolli Memory: Share Branch",
+				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.shareMemory",
+				"title": "Jolli Memory: Share Memory",
+				"category": "Jolli Memory"
+			}
+		],
+		"menus": {
+			"commandPalette": [
+				{
+					"command": "jollimemory.viewKnowledgeGraph",
+					"when": "false"
+				},
+				{
+					"command": "jollimemory.shareMemory",
+					"when": "false"
+				}
+			],
+			"jollimemory.addMenu": [
+				{
+					"command": "jollimemory.addPlan",
+					"group": "1_add@1"
+				},
+				{
+					"command": "jollimemory.addMarkdownNote",
+					"group": "1_add@2"
+				},
+				{
+					"command": "jollimemory.addTextSnippet",
+					"group": "1_add@3"
+				}
+			],
+			"explorer/context": [
+				{
+					"command": "jollimemory.revertMemoryFileEdits",
+					"when": "resourceFilename =~ /\\.md$/",
+					"group": "jollimemory@1"
+				}
+			],
+			"view/title": [
+				{
+					"command": "jollimemory.openSettings",
+					"when": "view == jollimemory.mainView",
+					"group": "navigation@1"
+				},
+				{
+					"command": "jollimemory.toggleStatus",
+					"when": "view == jollimemory.mainView",
+					"group": "navigation@2"
+				}
+			]
+		}
+	},
+	"scripts": {
+		"all": "npm run clean && npm run build && npm run lint && npm run test",
+		"clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
+		"typecheck": "tsc --noEmit -p tsconfig.build.json",
+		"lint": "npx biome check --error-on-warnings src/",
+		"lint:fix": "npx biome check --write src/",
+		"test": "node ./scripts/run-vitest.mjs --coverage",
+		"build": "npm run clean && node ./scripts/copy-codicons.mjs && node esbuild.config.mjs && node ./scripts/copy-graph-assets.mjs",
+		"build:watch": "node esbuild.config.mjs --watch",
+		"package": "npm run build && npx @vscode/vsce package --no-dependencies --allow-missing-repository",
+		"install:vsix": "node -e \"const v=require('./package.json').version;const {execSync}=require('child_process');const fs=require('fs');const path=require('path');const isWin=process.platform==='win32';let code;if(isWin){code=path.join(process.env.LOCALAPPDATA||'','Programs','Microsoft VS Code','bin','code.cmd')}else{const candidates=['/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code','/usr/bin/code','/snap/bin/code'];code=candidates.find(p=>fs.existsSync(p))||'code'}execSync((isWin?'\\\"'+code+'\\\"':'\\\"'+code+'\\\"')+' --install-extension goldjolli-vscode-'+v+'.vsix --force',{stdio:'inherit'});\"",
+		"deploy": "npm --prefix ../cli run build && npm install -g ../cli && npm run build && npm run package && npm run install:vsix",
+		"copy:codicons": "node ./scripts/copy-codicons.mjs"
+	},
+	"dependencies": {
+		"minimatch": "^10.2.4",
+		"open": "^11.0.0",
+		"@vscode/codicons": "^0.0.45"
+	},
+	"overrides": {
+		"brace-expansion": "^5.0.7"
+	},
+	"devDependencies": {
+		"@types/node": "^22.5.0",
+		"@types/vscode": "^1.80.0",
+		"@vitest/coverage-v8": "^4.1.2",
+		"@vscode/vsce": "^3.9.2",
+		"esbuild": "^0.28.1",
+		"typescript": "^5.7.2",
+		"vitest": "^4.1.2"
+	}
+}

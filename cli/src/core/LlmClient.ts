@@ -181,6 +181,15 @@ interface LlmCredentials {
 	readonly apiKey?: string;
 	/** Model alias or full ID (e.g. "haiku", "sonnet") */
 	readonly model?: string;
+	/**
+	 * Free-text language name (e.g. "Dutch", "German") for reader-facing
+	 * output. Empty/unset preserves the pre-existing behavior (the model's
+	 * natural default, effectively English) byte-for-byte — `callLlm` only
+	 * injects a `languageDirective` param when this is a non-empty string.
+	 * Not a fixed enum: this is deliberately open-ended so any language name
+	 * the model understands works without a code change.
+	 */
+	readonly summaryLanguage?: string;
 	/** Jolli Space API key for proxy mode (sk-jol-...) */
 	readonly jolliApiKey?: string;
 	/**
@@ -193,7 +202,15 @@ interface LlmCredentials {
 	 * Optional — legacy configs without this field fall through to the
 	 * credential-presence precedence below.
 	 */
-	readonly aiProvider?: "anthropic" | "jolli" | "local-agent";
+	readonly aiProvider?: "anthropic" | "jolli" | "local-agent" | "azure-foundry";
+	/** Azure AI Foundry / Azure OpenAI endpoint, e.g. https://<resource>.openai.azure.com */
+	readonly azureEndpoint?: string;
+	/** Azure AI Foundry / Azure OpenAI API key */
+	readonly azureApiKey?: string;
+	/** Azure deployment name for chat completions */
+	readonly azureDeployment?: string;
+	/** Azure API version (optional override) */
+	readonly azureApiVersion?: string;
 	/** Which local agent tool to drive when aiProvider === "local-agent" (v1: "claude-code"). */
 	readonly localAgentTool?: "claude-code";
 	/** Optional explicit path to the local agent binary, overriding PATH discovery. */
@@ -216,13 +233,22 @@ interface LlmCredentials {
  *      is always honored the moment it's chosen: it drives the local agent
  *      tool's own login rather than a jollimemory-held credential, so there is
  *      no presence check to fail.
- *   2. **Legacy precedence** (apiKey > ANTHROPIC_API_KEY env > jolliApiKey),
- *      used when `aiProvider` is undefined so existing configs continue to
- *      work unchanged. `"local-agent"` is never selected by this fallback —
- *      only the explicit choice above can pick it.
+ *   2. **Legacy precedence** (apiKey > full Azure Foundry config > ANTHROPIC_API_KEY
+ *      env > jolliApiKey), used when `aiProvider` is undefined so existing
+ *      configs continue to work unchanged. Azure sits ahead of the env var and
+ *      jolliApiKey here (not last) because a fully filled-in
+ *      endpoint+key+deployment is a deliberate one-time setup step — unlike an
+ *      ambient `ANTHROPIC_API_KEY` left in a shell profile or a `jolliApiKey`
+ *      leftover from a prior `jolli auth login` — so neither should silently
+ *      steal a call away from the user's own Azure resource. `"local-agent"` is
+ *      never selected by this fallback — only the explicit choice above can
+ *      pick it.
  */
 export function resolveLlmCredentialSource(
-	credentials: Pick<LlmCredentials, "apiKey" | "jolliApiKey" | "aiProvider">,
+	credentials: Pick<
+		LlmCredentials,
+		"apiKey" | "jolliApiKey" | "aiProvider" | "azureEndpoint" | "azureApiKey" | "azureDeployment"
+	>,
 ): LlmCredentialSource | null {
 	if (credentials.aiProvider === "local-agent") {
 		// The local agent uses the tool's own login (subscription OAuth); no
@@ -237,7 +263,13 @@ export function resolveLlmCredentialSource(
 		if (process.env.ANTHROPIC_API_KEY) return "anthropic-env";
 		return null;
 	}
+	if (credentials.aiProvider === "azure-foundry") {
+		return credentials.azureEndpoint && credentials.azureApiKey && credentials.azureDeployment
+			? "azure-foundry"
+			: null;
+	}
 	if (credentials.apiKey) return "anthropic-config";
+	if (credentials.azureEndpoint && credentials.azureApiKey && credentials.azureDeployment) return "azure-foundry";
 	if (process.env.ANTHROPIC_API_KEY) return "anthropic-env";
 	if (credentials.jolliApiKey) return "jolli-proxy";
 	return null;
@@ -246,7 +278,16 @@ export function resolveLlmCredentialSource(
 /** The credential-carrying fields callLlm needs to select and drive a provider. */
 type LlmCredentialFields = Pick<
 	LlmCredentials,
-	"apiKey" | "jolliApiKey" | "aiProvider" | "localAgentTool" | "localAgentPath"
+	| "apiKey"
+	| "jolliApiKey"
+	| "aiProvider"
+	| "azureEndpoint"
+	| "azureApiKey"
+	| "azureDeployment"
+	| "azureApiVersion"
+	| "localAgentTool"
+	| "localAgentPath"
+	| "summaryLanguage"
 >;
 
 /**
@@ -255,7 +296,10 @@ type LlmCredentialFields = Pick<
  * apiKey/jolliApiKey/aiProvider, which silently dropped the local-agent fields
  * (`localAgentTool` / `localAgentPath`) everywhere — a configured binary-path
  * override never reached the runner. Centralizing the field list here means a
- * new credential dimension is threaded to all call sites by editing one place.
+ * new credential dimension is threaded to all call sites by editing one place —
+ * `summaryLanguage` rode in on the same mechanism: every `callLlm` call site
+ * already spreads `llmCredentials(config)`, so adding the field here alone
+ * reaches every action without touching a single call site.
  * Keep `model` out — call sites resolve it via `resolveModelId` themselves.
  */
 export function llmCredentials(config: LlmCredentialFields): LlmCredentialFields {
@@ -263,8 +307,13 @@ export function llmCredentials(config: LlmCredentialFields): LlmCredentialFields
 		apiKey: config.apiKey,
 		jolliApiKey: config.jolliApiKey,
 		aiProvider: config.aiProvider,
+		azureEndpoint: config.azureEndpoint,
+		azureApiKey: config.azureApiKey,
+		azureDeployment: config.azureDeployment,
+		azureApiVersion: config.azureApiVersion,
 		localAgentTool: config.localAgentTool,
 		localAgentPath: config.localAgentPath,
+		summaryLanguage: config.summaryLanguage,
 	};
 }
 
@@ -346,9 +395,44 @@ export interface LlmCallResult {
 }
 
 /**
+ * Builds the `{{languageDirective}}` param value shared by every template that
+ * carries the placeholder (see PromptTemplates.ts). Empty string when no
+ * language is configured, so `fillTemplate` renders it as a blank line rather
+ * than leaving the literal `{{languageDirective}}` token in the prompt (an
+ * unfilled placeholder is left as-is by design — see `fillTemplate`'s
+ * docstring — which is why this must ALWAYS be supplied, never omitted from
+ * params). Free-text `language` (not a fixed enum) is deliberately trusted
+ * verbatim into the instruction: this only steers prose generation, it is
+ * never interpreted as code or a path, so there is nothing to sanitize.
+ */
+function buildLanguageDirective(language: string | undefined): string {
+	if (!language || language.trim().length === 0) return "";
+	return `LANGUAGE: Write all reader-facing prose content of your response in ${language.trim()}. Do not translate structural markers, section/field delimiters, JSON keys, XML-like tags, IDs, slugs, or code identifiers (file paths, function/class/variable names, CLI flags) -- keep those exactly as specified or as found in the input.`;
+}
+
+/**
  * Routes an LLM call to either the Anthropic SDK (direct) or the Jolli backend (proxy).
  */
-export async function callLlm(options: LlmCallOptions): Promise<LlmCallResult> {
+export async function callLlm(rawOptions: LlmCallOptions): Promise<LlmCallResult> {
+	// Every template that wants localized output carries a `{{languageDirective}}`
+	// placeholder (see PromptTemplates.ts); this is the one place that fills it,
+	// so a new template gets the feature just by adding the placeholder — no
+	// call-site changes needed (mirrors how `llmCredentials()` centralizes
+	// credential fields).
+	//
+	// Built via `Object.create` (prototype delegation), NOT object-spread: a
+	// spread reads every own enumerable property of `rawOptions` up front,
+	// which would eagerly consume (and freeze the value of) any credential
+	// field implemented as a getter — defeating callers that intentionally use
+	// a getter to simulate a credential disappearing between the routing
+	// check below and the inner provider call (see the "loses jolliApiKey" /
+	// "credential field disappears" tests). Prototype delegation keeps every
+	// unset own-property access on `options` (apiKey, jolliApiKey,
+	// azureEndpoint, ...) a live re-read through to `rawOptions`; only `params`
+	// is overridden as a real own property.
+	const options: LlmCallOptions = Object.assign(Object.create(rawOptions) as LlmCallOptions, {
+		params: { ...rawOptions.params, languageDirective: buildLanguageDirective(rawOptions.summaryLanguage) },
+	});
 	const source = resolveLlmCredentialSource(options);
 
 	// Single dispatch-site log so every call leaves a "which provider was used"
@@ -379,6 +463,8 @@ export async function callLlm(options: LlmCallOptions): Promise<LlmCallResult> {
 		}
 		case "local-agent":
 			return callLocalAgent(options, source);
+		case "azure-foundry":
+			return callAzureFoundry(options, source);
 		default:
 			throw new LlmCredentialError();
 	}
@@ -390,7 +476,7 @@ export async function callLlm(options: LlmCallOptions): Promise<LlmCallResult> {
  * onboarding hints) don't duplicate the string.
  */
 export const NO_LLM_PROVIDER_MESSAGE =
-	"No LLM provider available. Set an Anthropic API key (ANTHROPIC_API_KEY) or configure a Jolli Space API key (jolliApiKey).";
+	"No LLM provider available. Configure Anthropic (apiKey / ANTHROPIC_API_KEY), Jolli (jolliApiKey), local-agent, or Azure Foundry (azureEndpoint, azureApiKey, azureDeployment).";
 
 /**
  * Thrown by `callLlm` when no provider can be resolved from the supplied
@@ -698,6 +784,131 @@ async function callDirect(
 		cachedTokens: (response.usage.cache_read_input_tokens ?? 0) + (response.usage.cache_creation_input_tokens ?? 0),
 		apiLatencyMs: elapsed,
 		stopReason: response.stop_reason,
+		source,
+	};
+}
+
+const DEFAULT_AZURE_API_VERSION = "2024-06-01";
+
+/**
+ * Azure Foundry mode: call an Azure OpenAI-compatible Chat Completions
+ * endpoint using api-key auth. No `x-jolli-client` / `x-jolli-trace` headers
+ * are sent on this path — those only make sense for Jolli-owned backends, and
+ * this mode exists specifically so a call never touches Jolli infrastructure.
+ *
+ * Two URL shapes are supported, detected from `azureEndpoint`:
+ *  - **Classic deployment API**: `azureEndpoint` is a bare resource origin
+ *    (e.g. `https://<resource>.openai.azure.com`). The URL is built as
+ *    `/openai/deployments/<azureDeployment>/chat/completions?api-version=...`,
+ *    `azureDeployment` selects the model via the URL path, and `api-version`
+ *    always defaults to {@link DEFAULT_AZURE_API_VERSION} when not overridden.
+ *  - **Pre-built / gateway URL** (e.g. an APIM front door exposing the newer
+ *    OpenAI-compatible `.../openai/v1/chat/completions` surface): when
+ *    `azureEndpoint` already ends in `/chat/completions`, it is used verbatim
+ *    with no path appended. `api-version` is added only if the user explicitly
+ *    set `azureApiVersion` (the v1 surface doesn't require one), and
+ *    `azureDeployment` is sent as the request body's `model` field instead of
+ *    a URL segment, since there's no deployment path to carry it.
+ */
+async function callAzureFoundry(options: LlmCallOptions, source: LlmCredentialSource): Promise<LlmCallResult> {
+	const entry = TEMPLATES.get(options.action);
+	if (!entry) {
+		throw new Error(`Unknown LLM action: "${options.action}". Available: ${[...TEMPLATES.keys()].join(", ")}`);
+	}
+	const missing = findUnfilledPlaceholders(entry.template, options.params);
+	if (missing.length > 0) {
+		log.warn("Azure Foundry call has unfilled placeholders for action=%s: %s", options.action, missing.join(", "));
+	}
+	const prompt = fillTemplate(entry.template, options.params);
+	const endpoint = options.azureEndpoint?.replace(/\/+$/, "");
+	const apiKey = options.azureApiKey;
+	const deployment = options.azureDeployment;
+	if (!endpoint || !apiKey || !deployment) {
+		throw new Error("Azure Foundry mode requires azureEndpoint, azureApiKey, and azureDeployment");
+	}
+
+	// A pre-built gateway/v1 URL already names the full route; a classic
+	// resource origin still needs the deployment path + api-version appended.
+	const isPrebuiltUrl = /\/chat\/completions$/i.test(endpoint);
+	const url = isPrebuiltUrl
+		? options.azureApiVersion
+			? `${endpoint}?api-version=${encodeURIComponent(options.azureApiVersion)}`
+			: endpoint
+		: `${endpoint}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=${encodeURIComponent(options.azureApiVersion ?? DEFAULT_AZURE_API_VERSION)}`;
+	const maxTokens = options.maxTokens ?? 8192;
+	// `max_completion_tokens`, not the legacy `max_tokens` — reasoning-capable
+	// models (o-series, GPT-5.x) reject `max_tokens` outright ("Unsupported
+	// parameter") on both the classic Azure OpenAI API and the newer v1/gateway
+	// surface. `max_completion_tokens` is accepted by both the legacy
+	// chat-completions models and the reasoning-capable ones, so there's no
+	// need to branch on model family here.
+	const body = JSON.stringify({
+		...(isPrebuiltUrl ? { model: deployment } : {}),
+		messages: [{ role: "user", content: prompt }],
+		temperature: 0,
+		max_completion_tokens: maxTokens,
+	});
+
+	const startTime = Date.now();
+	let response: Response;
+	try {
+		response = await fetch(url, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"api-key": apiKey,
+			},
+			body,
+			signal: AbortSignal.timeout(options.timeoutMs ?? DIRECT_FETCH_TIMEOUT_MS),
+		});
+	} catch (err) {
+		const elapsedMs = Date.now() - startTime;
+		const message = err instanceof Error ? err.message : String(err);
+		const cause = err instanceof Error ? formatCause((err as { cause?: unknown }).cause) : "(non-error)";
+		log.error(
+			"Azure Foundry LLM fetch failed: action=%s url=%s elapsedMs=%d bodyChars=%d error=%s cause=%s",
+			options.action,
+			url,
+			elapsedMs,
+			body.length,
+			message,
+			cause,
+		);
+		throw err;
+	}
+
+	const elapsed = Date.now() - startTime;
+	if (!response.ok) {
+		const errorBody = await response.text();
+		log.error("Azure Foundry LLM error: status=%d body=%s", response.status, errorBody.substring(0, 500));
+		throw new Error(`Azure Foundry request failed with status ${response.status}: ${errorBody.substring(0, 200)}`);
+	}
+
+	const payload = (await response.json()) as {
+		choices?: Array<{ message?: { content?: string | Array<{ text?: string }> }; finish_reason?: string | null }>;
+		usage?: { prompt_tokens?: number; completion_tokens?: number };
+		model?: string;
+	};
+	const first = payload.choices?.[0];
+	const content = first?.message?.content;
+	const text =
+		typeof content === "string"
+			? content
+			: Array.isArray(content)
+				? content.map((part) => (typeof part?.text === "string" ? part.text : "")).join("\n")
+				: "";
+	if (!text.trim()) {
+		throw new Error("No text content in Azure Foundry response");
+	}
+
+	return {
+		text: text.trim(),
+		model: payload.model,
+		inputTokens: payload.usage?.prompt_tokens ?? 0,
+		outputTokens: payload.usage?.completion_tokens ?? 0,
+		cachedTokens: 0,
+		apiLatencyMs: elapsed,
+		stopReason: first?.finish_reason ?? null,
 		source,
 	};
 }

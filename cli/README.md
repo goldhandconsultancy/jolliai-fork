@@ -428,7 +428,7 @@ Healing is also exposed by the editor extensions; running the CLI form is equiva
 
 ### `jolli backfill`
 
-Creates memories for commits you made before enabling Jolli, so your existing history shows up too. Each commit is matched to the Claude transcripts recorded around it.
+Creates memories for commits you made before enabling Jolli, so your existing history shows up too. Each commit is matched to the Claude and VS Code Copilot Chat transcripts recorded around it.
 
 ```bash
 # Catch up on your recent commits (last 20 by default)
@@ -442,7 +442,7 @@ jolli backfill --all
 jolli backfill --dry-run
 ```
 
-Claude transcripts for now. Requires an API key (same as summary generation). The editor extensions offer to run this for you when you enable Jolli in a repo that already has commits.
+Matches Claude and Copilot Chat transcripts only (other sources aren't attributed retroactively yet). Requires an API key (same as summary generation). The editor extensions offer to run this for you when you enable Jolli in a repo that already has commits.
 
 ## Session Context Recall
 

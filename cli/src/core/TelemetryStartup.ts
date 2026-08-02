@@ -27,7 +27,7 @@ import {
 	loadConfig as defaultLoadConfig,
 	saveConfig as defaultSaveConfig,
 } from "./SessionTracker.js";
-import { initTelemetry, track } from "./Telemetry.js";
+import { initTelemetry, TELEMETRY_HARD_DISABLED, track } from "./Telemetry.js";
 import { clearTelemetryBuffer } from "./TelemetryBuffer.js";
 import { isTelemetryEnabled, shouldShowTelemetryNotice } from "./TelemetryConsent.js";
 import { flushTelemetry } from "./TelemetryFlusher.js";
@@ -111,6 +111,7 @@ export interface CliNoticeDeps {
  * Returns whether it printed (for tests).
  */
 export async function maybeShowCliTelemetryNotice(deps?: CliNoticeDeps): Promise<boolean> {
+	if (TELEMETRY_HARD_DISABLED) return false;
 	const loadConfig = deps?.loadConfig ?? defaultLoadConfig;
 	const saveConfig = deps?.saveConfig ?? defaultSaveConfig;
 	const write = deps?.write ?? ((s: string) => process.stderr.write(s));
@@ -153,6 +154,15 @@ export interface FlushNowDeps {
  * dropped instead of sent — honoring the `telemetry off` promise.
  */
 export async function flushTelemetryNow(cwd: string, deps?: FlushNowDeps): Promise<void> {
+	if (TELEMETRY_HARD_DISABLED) {
+		try {
+			await clearTelemetryBuffer(cwd);
+		} catch {
+			// Best-effort cleanup only.
+		}
+		return;
+	}
+
 	const loadConfig = deps?.loadConfig ?? defaultLoadConfig;
 	const getJolliUrl = deps?.getJolliUrl ?? defaultGetJolliUrl;
 	try {

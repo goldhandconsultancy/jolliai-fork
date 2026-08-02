@@ -213,7 +213,7 @@ export interface StatusResult {
 		 * so a caller must not report "no credential → memory generation disabled"
 		 * when this is `"local-agent"`. A plain enum, never key-derived.
 		 */
-		readonly aiProvider: "anthropic" | "jolli" | "local-agent" | null;
+		readonly aiProvider: "anthropic" | "jolli" | "local-agent" | "azure-foundry" | null;
 		/** Public site host (protocol stripped); null when none is persisted. */
 		readonly site: string | null;
 		/** "Jolli Site" when a disk credential backs the URL, else "Last signed-in site"; null when no site. */
@@ -242,7 +242,7 @@ export interface StatusAccountInput {
 	readonly jolliApiKeyConfigured: boolean;
 	readonly anthropicKeyConfigured: boolean;
 	/** Explicit `aiProvider` choice, or null when unset. A plain enum, not secret material. */
-	readonly aiProvider: "anthropic" | "jolli" | "local-agent" | null;
+	readonly aiProvider: "anthropic" | "jolli" | "local-agent" | "azure-foundry" | null;
 	/** Full persisted `jolliUrl` (with protocol) or null. Never derived from the API key. */
 	readonly site: string | null;
 	/** Whether an on-disk credential backs the site URL (drives siteLabel). */

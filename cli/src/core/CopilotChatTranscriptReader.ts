@@ -4,10 +4,22 @@
  * vscode persists each chat session as a JSONL document patch log:
  *   line 0:  {kind:0, v:<initial document>}
  *   line N:  {kind:1, k:[...path], v:<value>}   set at path
- *   line N:  {kind:2, k:[...path]}              delete at path
+ *   line N:  {kind:2, k:[...path]}              delete at path (no `v`)
+ *   line N:  {kind:2, k:[...path], v:<array>}   append `v`'s elements at path (has `v`)
  *
- * To reconstruct the conversation we replay all patches in order, then read
- * `requests[]` from the final document. See spec
+ * kind:2 is overloaded on whether `v` is present — confirmed against real
+ * GitHub Copilot Chat 0.55.0 session logs. Without `v` it's a removal (e.g.
+ * `pendingRequests` cleanup via array splice). With `v` it's an append: vscode
+ * batches new `requests[]` entries and streamed `requests[N].response` chunks
+ * this way instead of resending the whole array on every line. A version of
+ * this reader that (incorrectly) treated every kind:2 as delete-at-path would
+ * end up deleting the ENTIRE `requests` array the first time a new request
+ * arrived (`k: ["requests"]`, appending request 0) and never restore it,
+ * making `readPatchLog`'s `Array.isArray(requests)` check fail with a schema
+ * error for every non-trivial real conversation — silently discarding
+ * `requests[N].response` (streamed answer chunks) the same way even where
+ * `requests` itself survived. To reconstruct the conversation we replay all
+ * patches in order, then read `requests[]` from the final document. See spec
  * docs/superpowers/specs/2026-05-06-copilot-chat-support-design.md.
  */
 
@@ -46,6 +58,35 @@ export function _setAtPath(doc: unknown, path: PathSegment[], value: unknown): v
 }
 
 /**
+ * Mutates `doc` in place by appending `value`'s elements to the array at
+ * `path` (creating intermediate objects/arrays as needed, same shape rule as
+ * {@link _setAtPath}). When nothing exists yet at `path`, initializes it as an
+ * empty array first. A non-array `value` is appended as a single element
+ * (defensive — every real kind:2-with-`v` event observed carries an array,
+ * but nothing in the wire format guarantees it always will).
+ */
+export function _appendAtPath(doc: unknown, path: PathSegment[], value: unknown): void {
+	if (path.length === 0) return;
+	let cur = doc as Record<string | number, unknown>;
+	for (let i = 0; i < path.length - 1; i++) {
+		const seg = path[i];
+		const next = path[i + 1];
+		if (cur[seg] === undefined || cur[seg] === null) {
+			cur[seg] = typeof next === "number" ? [] : {};
+		}
+		cur = cur[seg] as Record<string | number, unknown>;
+	}
+	const last = path[path.length - 1];
+	const items = Array.isArray(value) ? value : [value];
+	const existing = cur[last];
+	if (Array.isArray(existing)) {
+		existing.push(...items);
+	} else {
+		cur[last] = items.slice();
+	}
+}
+
+/**
  * Mutates `doc` in place by removing the value at `path`. No-op if the path
  * doesn't exist or is empty. For array elements, uses `splice` so the array
  * shifts (matching vscode's emitted semantics for `pendingRequests` cleanup).
@@ -80,6 +121,8 @@ interface KindOneEvent {
 interface KindTwoEvent {
 	kind: 2;
 	k: PathSegment[];
+	/** Present → append (see module docstring); absent → delete-at-path. */
+	v?: unknown;
 }
 type PatchEvent = KindZeroEvent | KindOneEvent | KindTwoEvent | { kind: number };
 
@@ -88,7 +131,9 @@ type PatchEvent = KindZeroEvent | KindOneEvent | KindTwoEvent | { kind: number }
  *
  *   kind 0 → replace entire document with `v`
  *   kind 1 → set `v` at path `k`
- *   kind 2 → delete value at path `k`
+ *   kind 2 → append `v`'s elements at path `k` when `v` is present, else
+ *            delete the value at path `k` (see module docstring for why this
+ *            is overloaded on `v`'s presence)
  *
  * Unknown `kind` is logged and skipped (forward compatibility — vscode may add
  * new event types in future versions). JSON parse errors are propagated so the
@@ -109,7 +154,11 @@ export function _replayPatches(lines: ReadonlyArray<string>): unknown {
 			}
 			case 2: {
 				const e = evt as KindTwoEvent;
-				_deleteAtPath(doc, e.k);
+				if (e.v !== undefined) {
+					_appendAtPath(doc, e.k, e.v);
+				} else {
+					_deleteAtPath(doc, e.k);
+				}
 				break;
 			}
 			default:

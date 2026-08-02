@@ -46,8 +46,9 @@ export async function saveAuthToken(token: string): Promise<void> {
  *
  * Also writes `aiProvider: "jolli"` because clicking "Sign in to Jolli" is the
  * user's explicit declaration of intent to use Jolli for AI summaries — UNLESS
- * the user has already explicitly chosen `aiProvider: "anthropic"` OR
- * `aiProvider: "local-agent"` in Settings. In that case we leave the choice
+ * the user has already explicitly chosen `aiProvider: "anthropic"`,
+ * `aiProvider: "local-agent"`, OR `aiProvider: "azure-foundry"` in Settings.
+ * In that case we leave the choice
  * alone: a deliberate provider pick should outlast a sign-in (e.g. user signs in
  * just to push memories to a Space, not to switch summary engines). This matters
  * for the Claude Code plugin, which defaults to `local-agent` — logging in to
@@ -87,7 +88,11 @@ export async function saveAuthCredentials(credentials: {
 		authToken: credentials.token,
 		jolliUrl: normalizedJolliUrl,
 	};
-	if (config.aiProvider !== "anthropic" && config.aiProvider !== "local-agent") {
+	if (
+		config.aiProvider !== "anthropic" &&
+		config.aiProvider !== "local-agent" &&
+		config.aiProvider !== "azure-foundry"
+	) {
 		update.aiProvider = "jolli";
 	}
 	if (credentials.jolliApiKey) {

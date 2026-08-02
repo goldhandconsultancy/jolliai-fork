@@ -2,7 +2,13 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { _deleteAtPath, _replayPatches, _setAtPath, readCopilotChatTranscript } from "./CopilotChatTranscriptReader.js";
+import {
+	_appendAtPath,
+	_deleteAtPath,
+	_replayPatches,
+	_setAtPath,
+	readCopilotChatTranscript,
+} from "./CopilotChatTranscriptReader.js";
 
 describe("_setAtPath", () => {
 	it("sets a leaf string key on an object", () => {
@@ -50,6 +56,56 @@ describe("_setAtPath", () => {
 		// Empty path is undefined behavior in patch terms — we expect no change here
 		// since the caller (replayPatches kind:0) handles root replacement directly.
 		expect(doc).toEqual({ a: 1 });
+	});
+});
+
+describe("_appendAtPath", () => {
+	it("initializes a missing array and appends the given array's elements", () => {
+		const doc: Record<string, unknown> = {};
+		_appendAtPath(doc, ["requests"], [{ id: "r1" }]);
+		expect(doc).toEqual({ requests: [{ id: "r1" }] });
+	});
+
+	it("appends onto an existing array without replacing prior elements", () => {
+		const doc: Record<string, unknown> = { requests: [{ id: "r1" }] };
+		_appendAtPath(doc, ["requests"], [{ id: "r2" }]);
+		expect(doc.requests).toEqual([{ id: "r1" }, { id: "r2" }]);
+	});
+
+	it("appends into an existing nested array", () => {
+		const doc: Record<string, unknown> = { requests: [{}] };
+		_appendAtPath(doc, ["requests", 0, "response"], [{ value: "chunk1" }]);
+		expect(doc).toEqual({ requests: [{ response: [{ value: "chunk1" }] }] });
+	});
+
+	it("creates a missing intermediate object when the next segment is a string key", () => {
+		const doc: Record<string, unknown> = {};
+		_appendAtPath(doc, ["a", "b"], [1]);
+		expect(doc).toEqual({ a: { b: [1] } });
+	});
+
+	it("appends further chunks onto an already-populated nested array", () => {
+		const doc: Record<string, unknown> = { requests: [{ response: [{ value: "chunk1" }] }] };
+		_appendAtPath(doc, ["requests", 0, "response"], [{ value: "chunk2" }]);
+		expect(doc).toEqual({ requests: [{ response: [{ value: "chunk1" }, { value: "chunk2" }] }] });
+	});
+
+	it("wraps a non-array value as a single appended element (defensive)", () => {
+		const doc: Record<string, unknown> = {};
+		_appendAtPath(doc, ["tags"], "solo");
+		expect(doc).toEqual({ tags: ["solo"] });
+	});
+
+	it("is a no-op for an empty path", () => {
+		const doc: Record<string, unknown> = { a: 1 };
+		_appendAtPath(doc, [], [1, 2]);
+		expect(doc).toEqual({ a: 1 });
+	});
+
+	it("replaces a non-array existing value at the target rather than merging into it", () => {
+		const doc: Record<string, unknown> = { requests: "not-an-array" };
+		_appendAtPath(doc, ["requests"], [{ id: "r1" }]);
+		expect(doc).toEqual({ requests: [{ id: "r1" }] });
 	});
 });
 
@@ -118,12 +174,38 @@ describe("_replayPatches", () => {
 		expect(_replayPatches(lines)).toEqual({ requests: [{ message: { text: "hello" } }] });
 	});
 
-	it("applies kind:2 as delete-at-path", () => {
+	it("applies kind:2 without a `v` as delete-at-path (e.g. pendingRequests cleanup)", () => {
 		const lines = [
 			JSON.stringify({ kind: 0, v: { pendingRequests: [{ id: "x" }] } }),
 			JSON.stringify({ kind: 2, k: ["pendingRequests", 0] }),
 		];
 		expect(_replayPatches(lines)).toEqual({ pendingRequests: [] });
+	});
+
+	// Pins the real-world fix: GitHub Copilot Chat 0.55.0 batches new `requests[]`
+	// entries via kind:2 WITH a `v` payload — a version that always treated kind:2
+	// as delete-at-path wiped the entire `requests` array on the very first new
+	// request, later failing `readPatchLog`'s `Array.isArray(requests)` check for
+	// every non-trivial real conversation.
+	it("applies kind:2 WITH a `v` as append-at-path, not delete (real Copilot Chat 0.55.0 shape)", () => {
+		const lines = [
+			JSON.stringify({ kind: 0, v: { requests: [] } }),
+			JSON.stringify({ kind: 2, k: ["requests"], v: [{ requestId: "r1" }] }),
+			JSON.stringify({ kind: 1, k: ["requests", 0, "message"], v: { text: "hi" } }),
+			JSON.stringify({ kind: 2, k: ["requests"], v: [{ requestId: "r2" }] }),
+			JSON.stringify({ kind: 2, k: ["requests", 0, "response"], v: [{ value: "chunk1" }] }),
+			JSON.stringify({ kind: 2, k: ["requests", 0, "response"], v: [{ value: "chunk2" }] }),
+		];
+		expect(_replayPatches(lines)).toEqual({
+			requests: [
+				{
+					requestId: "r1",
+					message: { text: "hi" },
+					response: [{ value: "chunk1" }, { value: "chunk2" }],
+				},
+				{ requestId: "r2" },
+			],
+		});
 	});
 
 	it("applies patches in file order", () => {

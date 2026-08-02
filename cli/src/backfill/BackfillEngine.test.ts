@@ -29,6 +29,9 @@ vi.mock("./RawTranscriptScanner.js", () => ({
 	scanClaudeTranscripts: vi.fn().mockResolvedValue(new Map()),
 	cwdInRoots: vi.fn().mockReturnValue(() => true),
 }));
+vi.mock("./RawCopilotChatTranscriptScanner.js", () => ({
+	scanCopilotChatTranscriptsForBackfill: vi.fn().mockResolvedValue(new Map()),
+}));
 vi.mock("./CommitTargetIndex.js", () => ({
 	buildCommitTargetIndex: vi.fn().mockResolvedValue({
 		commitMeta: new Map(),
@@ -55,6 +58,8 @@ import { getIndexEntryMap, storeSummary } from "../core/SummaryStore.js";
 import { launchWorker } from "../hooks/QueueWorker.js";
 import { countMissingSummaries, runBackfill } from "./BackfillEngine.js";
 import { attributeCommits } from "./CommitAttributor.js";
+import { scanCopilotChatTranscriptsForBackfill } from "./RawCopilotChatTranscriptScanner.js";
+import { scanClaudeTranscripts } from "./RawTranscriptScanner.js";
 
 const CWD = "e:/repo";
 
@@ -118,6 +123,96 @@ describe("runBackfill", () => {
 		// Exactly one ingest trigger for the whole batch.
 		expect(vi.mocked(enqueueIngestOperation)).toHaveBeenCalledTimes(1);
 		expect(vi.mocked(launchWorker)).toHaveBeenCalledTimes(1);
+	});
+
+	describe("Copilot Chat integration", () => {
+		const claudeEntry = {
+			sessionId: "claude-sid",
+			transcriptPath: "/p/claude.jsonl",
+			source: "claude" as const,
+			lineNo: 0,
+			tsMs: 1,
+			editedRel: [],
+			editedBase: [],
+		};
+		const copilotEntry = {
+			sessionId: "copilot-chat:cc-sid",
+			transcriptPath: "/p/cc.jsonl",
+			source: "copilot-chat" as const,
+			lineNo: 0,
+			tsMs: 2,
+			cwd: CWD,
+			editedRel: [],
+			editedBase: [],
+		};
+
+		it("merges Copilot Chat sessions into the transcript index by default (copilotEnabled unset)", async () => {
+			vi.mocked(scanClaudeTranscripts).mockResolvedValue(new Map([["claude-sid", [claudeEntry]]]));
+			vi.mocked(scanCopilotChatTranscriptsForBackfill).mockResolvedValue(
+				new Map([["copilot-chat:cc-sid", [copilotEntry]]]),
+			);
+			vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+
+			await runBackfill({ cwd: CWD, hashes: ["c1"] });
+
+			expect(vi.mocked(scanCopilotChatTranscriptsForBackfill)).toHaveBeenCalled();
+			const bySession = vi.mocked(attributeCommits).mock.calls[0][1];
+			expect(bySession.get("claude-sid")).toEqual([claudeEntry]);
+			expect(bySession.get("copilot-chat:cc-sid")).toEqual([copilotEntry]);
+		});
+
+		it("skips Copilot Chat scanning when copilotEnabled is explicitly false", async () => {
+			vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-ant-test", copilotEnabled: false } as never);
+			vi.mocked(scanClaudeTranscripts).mockResolvedValue(new Map([["claude-sid", [claudeEntry]]]));
+			vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+
+			await runBackfill({ cwd: CWD, hashes: ["c1"] });
+
+			expect(vi.mocked(scanCopilotChatTranscriptsForBackfill)).not.toHaveBeenCalled();
+			const bySession = vi.mocked(attributeCommits).mock.calls[0][1];
+			expect(bySession.has("copilot-chat:cc-sid")).toBe(false);
+		});
+	});
+
+	it("threads Azure Foundry credentials through to generateSummary's config (backfill parity with the live LLM dispatcher)", async () => {
+		vi.mocked(loadConfig).mockResolvedValue({
+			aiProvider: "azure-foundry",
+			azureEndpoint: "https://my-resource.openai.azure.com",
+			azureApiKey: "azure-secret",
+			azureDeployment: "gpt-4.1-mini",
+			azureApiVersion: "2024-10-21",
+		} as never);
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+
+		await runBackfill({ cwd: CWD, hashes: ["c1"] });
+
+		expect(vi.mocked(generateSummary)).toHaveBeenCalledWith(
+			expect.objectContaining({
+				config: expect.objectContaining({
+					aiProvider: "azure-foundry",
+					azureEndpoint: "https://my-resource.openai.azure.com",
+					azureApiKey: "azure-secret",
+					azureDeployment: "gpt-4.1-mini",
+					azureApiVersion: "2024-10-21",
+				}),
+			}),
+		);
+	});
+
+	it("threads summaryLanguage through to generateSummary's config (same pattern as the Azure fields above)", async () => {
+		vi.mocked(loadConfig).mockResolvedValue({
+			apiKey: "sk-ant-test",
+			summaryLanguage: "Dutch",
+		} as never);
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+
+		await runBackfill({ cwd: CWD, hashes: ["c1"] });
+
+		expect(vi.mocked(generateSummary)).toHaveBeenCalledWith(
+			expect.objectContaining({
+				config: expect.objectContaining({ summaryLanguage: "Dutch" }),
+			}),
+		);
 	});
 
 	it("falls back to [cwd] when `git worktree list` fails", async () => {
@@ -243,6 +338,34 @@ describe("runBackfill", () => {
 		expect(report.outcomes[0].status).toBe("skipped-has-summary");
 		// All candidates already summarized → no attribution / ingest at all.
 		expect(vi.mocked(attributeCommits)).not.toHaveBeenCalled();
+	});
+
+	describe("force (regenerate an already-summarized commit)", () => {
+		it("bypasses the already-summarized skip and regenerates when force:true", async () => {
+			vi.mocked(getIndexEntryMap).mockResolvedValue(new Map([["c1", {} as never]]));
+			vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+
+			const report = await runBackfill({ cwd: CWD, hashes: ["c1"], force: true });
+
+			expect(report.outcomes[0].status).toBe("generated");
+			expect(vi.mocked(attributeCommits)).toHaveBeenCalled();
+			// storeSummary's own `force` param (4th positional arg) must be true so it
+			// actually overwrites rather than silently no-op-skipping again downstream.
+			expect(vi.mocked(storeSummary).mock.calls[0][2]).toBe(true);
+		});
+
+		it("still skips when force is false/omitted, even with an otherwise-identical setup", async () => {
+			vi.mocked(getIndexEntryMap).mockResolvedValue(new Map([["c1", {} as never]]));
+			const report = await runBackfill({ cwd: CWD, hashes: ["c1"], force: false });
+			expect(report.outcomes[0].status).toBe("skipped-has-summary");
+			expect(vi.mocked(storeSummary)).not.toHaveBeenCalled();
+		});
+
+		it("passes force:false to storeSummary for a normal (non-forced) new commit", async () => {
+			vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+			await runBackfill({ cwd: CWD, hashes: ["c1"] });
+			expect(vi.mocked(storeSummary).mock.calls[0][2]).toBe(false);
+		});
 	});
 
 	it("generates a diff-only summary when no conversation is attributed (mirrors live no-session path)", async () => {

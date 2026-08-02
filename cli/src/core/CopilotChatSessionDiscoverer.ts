@@ -43,6 +43,20 @@ export interface CopilotChatScanResult {
 	readonly error?: CopilotChatScanError;
 }
 
+/** Options threading a non-default staleness cutoff through the two scans. */
+export interface CopilotChatScanOptions {
+	/**
+	 * Max session age to accept, in ms. Defaults to {@link SESSION_STALE_MS}
+	 * (48h), matching every other discovery-based source. Pass
+	 * `Number.POSITIVE_INFINITY` to accept every session regardless of age —
+	 * used by the historical back-fill scan
+	 * ({@link RawCopilotChatTranscriptScanner.scanCopilotChatTranscriptsForBackfill}),
+	 * which (unlike the live 60s-tick / post-commit discovery this module's
+	 * other callers use) needs sessions from long before the last 48h.
+	 */
+	readonly maxAgeMs?: number;
+}
+
 interface VscodeMetadata {
 	workspaceFolder?: { folderPath?: string };
 }
@@ -52,7 +66,7 @@ interface VscodeMetadata {
  * Returns sessions and an optional error when readdir of the root fails for
  * non-ENOENT reasons.
  */
-async function scanSessionState(projectDir: string): Promise<CopilotChatScanResult> {
+async function scanSessionState(projectDir: string, maxAgeMs: number): Promise<CopilotChatScanResult> {
 	const root = join(homedir(), ".copilot", "session-state");
 	let entries: string[];
 	try {
@@ -64,7 +78,7 @@ async function scanSessionState(projectDir: string): Promise<CopilotChatScanResu
 		return { sessions: [], error: { kind: "fs", message: (error as Error).message } };
 	}
 
-	const cutoffMs = Date.now() - SESSION_STALE_MS;
+	const cutoffMs = Date.now() - maxAgeMs;
 	const target = normalizePathForMatch(projectDir);
 	const sessions: SessionInfo[] = [];
 
@@ -110,7 +124,7 @@ async function scanSessionState(projectDir: string): Promise<CopilotChatScanResu
  * (deprecated). Returns sessions and an optional error on non-ENOENT readdir
  * failure.
  */
-async function scanChatSessions(projectDir: string): Promise<CopilotChatScanResult> {
+async function scanChatSessions(projectDir: string, maxAgeMs: number): Promise<CopilotChatScanResult> {
 	const wsHash = await findVscodeWorkspaceHash("Code", projectDir);
 	if (wsHash === null) {
 		log.debug("No vscode workspace matched %s", projectDir);
@@ -128,7 +142,7 @@ async function scanChatSessions(projectDir: string): Promise<CopilotChatScanResu
 		return { sessions: [], error: { kind: "fs", message: (error as Error).message } };
 	}
 
-	const cutoffMs = Date.now() - SESSION_STALE_MS;
+	const cutoffMs = Date.now() - maxAgeMs;
 	const sessions: SessionInfo[] = [];
 
 	for (const entry of entries) {
@@ -156,11 +170,17 @@ async function scanChatSessions(projectDir: string): Promise<CopilotChatScanResu
 
 /**
  * Runs Scan A then Scan B; concatenates sessions; returns the first error
- * encountered (subsequent are debug-logged).
+ * encountered (subsequent are debug-logged). `opts.maxAgeMs` defaults to the
+ * standard 48h staleness cutoff — pass `Number.POSITIVE_INFINITY` to accept
+ * every session regardless of age (see {@link CopilotChatScanOptions}).
  */
-export async function scanCopilotChatSessions(projectDir: string): Promise<CopilotChatScanResult> {
-	const a = await scanSessionState(projectDir);
-	const b = await scanChatSessions(projectDir);
+export async function scanCopilotChatSessions(
+	projectDir: string,
+	opts: CopilotChatScanOptions = {},
+): Promise<CopilotChatScanResult> {
+	const maxAgeMs = opts.maxAgeMs ?? SESSION_STALE_MS;
+	const a = await scanSessionState(projectDir, maxAgeMs);
+	const b = await scanChatSessions(projectDir, maxAgeMs);
 	const sessions = [...a.sessions, ...b.sessions];
 	const error = a.error ?? b.error;
 	if (a.error && b.error) {

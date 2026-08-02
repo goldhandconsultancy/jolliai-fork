@@ -11,10 +11,21 @@ import {
 	saltedHash,
 	scrubProperties,
 	shutdownTelemetry,
+	TELEMETRY_HARD_DISABLED,
 	track,
 	trackError,
 } from "./Telemetry.js";
 import { readTelemetryEvents } from "./TelemetryBuffer.js";
+
+/**
+ * GoldJolli fork: `TELEMETRY_HARD_DISABLED` (see Telemetry.ts) makes
+ * `initTelemetry`/`track`/`trackError` unconditional no-ops regardless of
+ * consent, so the handful of upstream tests below that assert an actual
+ * buffered envelope are skipped rather than deleted — they document the
+ * pre-fork contract and would come back to life automatically if this fork
+ * ever flips the switch back.
+ */
+const itUnlessHardDisabled = TELEMETRY_HARD_DISABLED ? it.skip : it;
 
 let cwd: string;
 
@@ -160,7 +171,7 @@ describe("track / initTelemetry", () => {
 		expect(await readTelemetryEvents(cwd)).toEqual([]);
 	});
 
-	it("buffers a fully-formed envelope when enabled", async () => {
+	itUnlessHardDisabled("buffers a fully-formed envelope when enabled", async () => {
 		initTelemetry(baseInit({ sessionId: "sess-9" }));
 		track("recall_performed", { result_count_bucket: "1-5", hit: true });
 		const events = await readTelemetryEvents(cwd);
@@ -182,14 +193,14 @@ describe("track / initTelemetry", () => {
 		expect(e.eventId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
 	});
 
-	it("omits sessionId when none is provided", async () => {
+	itUnlessHardDisabled("omits sessionId when none is provided", async () => {
 		initTelemetry(baseInit());
 		track("search_performed");
 		const [e] = await readTelemetryEvents(cwd);
 		expect(e).not.toHaveProperty("sessionId");
 	});
 
-	it("mints a distinct eventId per event (idempotency key)", async () => {
+	itUnlessHardDisabled("mints a distinct eventId per event (idempotency key)", async () => {
 		initTelemetry(baseInit());
 		track("search_performed");
 		track("search_performed");
@@ -239,7 +250,7 @@ describe("track / initTelemetry", () => {
 describe("trackError (JOLLI-1961)", () => {
 	const baseInit = () => ({ cwd, installId: "install-1", origin: "https://acme.jolli.ai", config: {} });
 
-	it("emits error_occurred with the full content-free schema", async () => {
+	itUnlessHardDisabled("emits error_occurred with the full content-free schema", async () => {
 		initTelemetry(baseInit());
 		trackError("ingest", "ROUTE_FAILED", { source: "claude", retryable: true });
 		const [e] = await readTelemetryEvents(cwd);
@@ -247,17 +258,40 @@ describe("trackError (JOLLI-1961)", () => {
 		expect(e.properties).toEqual({ where: "ingest", code: "ROUTE_FAILED", source: "claude", retryable: true });
 	});
 
-	it("omits absent optional fields (where + code only)", async () => {
+	itUnlessHardDisabled("omits absent optional fields (where + code only)", async () => {
 		initTelemetry(baseInit());
 		trackError("push", "push_failed");
 		const [e] = await readTelemetryEvents(cwd);
 		expect(e.properties).toEqual({ where: "push", code: "push_failed" });
 	});
 
-	it("includes retryable:false when explicitly false", async () => {
+	itUnlessHardDisabled("includes retryable:false when explicitly false", async () => {
 		initTelemetry(baseInit());
 		trackError("sync", "conflict", { retryable: false });
 		const [e] = await readTelemetryEvents(cwd);
 		expect(e.properties).toEqual({ where: "sync", code: "conflict", retryable: false });
+	});
+});
+
+describe("TELEMETRY_HARD_DISABLED (GoldJolli fork kill switch)", () => {
+	it("is on", () => {
+		expect(TELEMETRY_HARD_DISABLED).toBe(true);
+	});
+
+	it("overrides full consent — initTelemetry still reports enabled:false and track()/trackError() still no-op", async () => {
+		initTelemetry({
+			cwd,
+			installId: "install-1",
+			sessionId: "sess-9",
+			origin: "https://acme.jolli.ai",
+			config: {},
+			env: {},
+			platformDisabled: false,
+		});
+		expect(getTelemetryContext()?.enabled).toBe(false);
+
+		track("recall_performed", { hit: true });
+		trackError("ingest", "ROUTE_FAILED");
+		expect(await readTelemetryEvents(cwd)).toEqual([]);
 	});
 });

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { JolliMemoryConfig } from "../Types.js";
-import { getTelemetryContext, shutdownTelemetry } from "./Telemetry.js";
+import { getTelemetryContext, shutdownTelemetry, TELEMETRY_HARD_DISABLED } from "./Telemetry.js";
 import { appendTelemetryEvent, readTelemetryEvents, type TelemetryEnvelope } from "./TelemetryBuffer.js";
 import {
 	type BootstrapDeps,
@@ -13,6 +13,14 @@ import {
 	maybeShowCliTelemetryNotice,
 	resolveTelemetryOrigin,
 } from "./TelemetryStartup.js";
+
+/**
+ * GoldJolli fork: `TELEMETRY_HARD_DISABLED` (Telemetry.ts) makes these
+ * startup hooks unconditional no-ops, so the handful of upstream tests below
+ * that assert an actual enabled/sent outcome are skipped rather than deleted
+ * — see the matching note in Telemetry.test.ts.
+ */
+const itUnlessHardDisabled = TELEMETRY_HARD_DISABLED ? it.skip : it;
 
 let cwd: string;
 
@@ -64,7 +72,7 @@ describe("bootstrapTelemetry", () => {
 		getJolliUrl: () => "https://jolli.ai",
 	});
 
-	it("initializes context and fires app_installed on first run (created=true)", async () => {
+	itUnlessHardDisabled("initializes context and fires app_installed on first run (created=true)", async () => {
 		await bootstrapTelemetry({ cwd, deps: deps({ jolliUrl: "https://acme.jolli.ai" }, true) });
 		const ctx = getTelemetryContext();
 		expect(ctx?.enabled).toBe(true);
@@ -74,7 +82,7 @@ describe("bootstrapTelemetry", () => {
 		expect(events.map((e) => e.eventName)).toEqual(["app_installed"]);
 	});
 
-	it("does not fire app_installed on a returning run (created=false)", async () => {
+	itUnlessHardDisabled("does not fire app_installed on a returning run (created=false)", async () => {
 		await bootstrapTelemetry({ cwd, deps: deps({ jolliUrl: "https://acme.jolli.ai" }, false) });
 		expect(await readTelemetryEvents(cwd)).toEqual([]);
 		expect(getTelemetryContext()?.enabled).toBe(true);
@@ -101,25 +109,26 @@ describe("bootstrapTelemetry", () => {
 	});
 });
 
-describe("flushTelemetryNow", () => {
-	const ev = (over: Partial<TelemetryEnvelope> = {}): TelemetryEnvelope => ({
-		schemaVersion: 1,
-		eventId: "33333333-3333-4333-8333-333333333333",
-		eventName: "app_installed",
-		surface: "cli",
-		surfaceVersion: "1.0.0",
-		installId: "11111111-1111-4111-8111-111111111111",
-		os: "darwin",
-		arch: "arm64",
-		runtimeVersion: "node-22.5.0",
-		env: "local",
-		tsIso: "2026-06-20T00:00:00.000Z",
-		accountId: null,
-		properties: {},
-		...over,
-	});
+/** Shared by both `flushTelemetryNow` describes below. */
+const ev = (over: Partial<TelemetryEnvelope> = {}): TelemetryEnvelope => ({
+	schemaVersion: 1,
+	eventId: "33333333-3333-4333-8333-333333333333",
+	eventName: "app_installed",
+	surface: "cli",
+	surfaceVersion: "1.0.0",
+	installId: "11111111-1111-4111-8111-111111111111",
+	os: "darwin",
+	arch: "arm64",
+	runtimeVersion: "node-22.5.0",
+	env: "local",
+	tsIso: "2026-06-20T00:00:00.000Z",
+	accountId: null,
+	properties: {},
+	...over,
+});
 
-	it("resolves origin from config and flushes the buffer", async () => {
+describe("flushTelemetryNow", () => {
+	itUnlessHardDisabled("resolves origin from config and flushes the buffer", async () => {
 		appendTelemetryEvent(cwd, ev());
 		const fetchImpl = vi.fn<typeof fetch>(async () => ({ ok: true }) as Response);
 		await flushTelemetryNow(cwd, {
@@ -132,7 +141,7 @@ describe("flushTelemetryNow", () => {
 		expect(await readTelemetryEvents(cwd)).toEqual([]);
 	});
 
-	it("never throws when config loading fails", async () => {
+	itUnlessHardDisabled("never throws when config loading fails", async () => {
 		appendTelemetryEvent(cwd, ev());
 		await expect(
 			flushTelemetryNow(cwd, {
@@ -170,7 +179,7 @@ describe("flushTelemetryNow", () => {
 });
 
 describe("maybeShowCliTelemetryNotice", () => {
-	it("prints once and records telemetryNoticeShown when enabled & not yet shown", async () => {
+	itUnlessHardDisabled("prints once and records telemetryNoticeShown when enabled & not yet shown", async () => {
 		const writes: string[] = [];
 		const saved: Partial<JolliMemoryConfig>[] = [];
 		const printed = await maybeShowCliTelemetryNotice({
@@ -223,5 +232,54 @@ describe("maybeShowCliTelemetryNotice", () => {
 				},
 			}),
 		).resolves.toBe(false);
+	});
+});
+
+describe("TELEMETRY_HARD_DISABLED (GoldJolli fork kill switch)", () => {
+	it("is on", () => {
+		expect(TELEMETRY_HARD_DISABLED).toBe(true);
+	});
+
+	it("bootstrapTelemetry never fires app_installed and reports enabled:false, even on a fresh install", async () => {
+		await bootstrapTelemetry({
+			cwd,
+			deps: {
+				loadConfig: async () => ({ jolliUrl: "https://acme.jolli.ai" }),
+				getOrCreateInstallId: async () => ({
+					installId: "11111111-1111-4111-8111-111111111111",
+					created: true,
+				}),
+				getJolliUrl: () => "https://jolli.ai",
+			},
+		});
+		expect(getTelemetryContext()?.enabled).toBe(false);
+		expect(await readTelemetryEvents(cwd)).toEqual([]);
+	});
+
+	it("flushTelemetryNow clears the buffer without ever calling fetch, regardless of deps", async () => {
+		appendTelemetryEvent(cwd, ev());
+		const fetchImpl = vi.fn<typeof fetch>(async () => ({ ok: true }) as Response);
+		await flushTelemetryNow(cwd, {
+			loadConfig: async () => {
+				throw new Error("would normally be swallowed and keep the buffer intact");
+			},
+			fetchImpl,
+		});
+		expect(fetchImpl).not.toHaveBeenCalled();
+		expect(await readTelemetryEvents(cwd)).toEqual([]);
+	});
+
+	it("maybeShowCliTelemetryNotice always returns false without writing or touching config", async () => {
+		const writes: string[] = [];
+		const saveConfig = vi.fn();
+		const printed = await maybeShowCliTelemetryNotice({
+			loadConfig: async () => ({}),
+			saveConfig,
+			env: {},
+			write: (s) => writes.push(s),
+		});
+		expect(printed).toBe(false);
+		expect(writes).toEqual([]);
+		expect(saveConfig).not.toHaveBeenCalled();
 	});
 });

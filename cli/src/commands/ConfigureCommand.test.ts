@@ -192,6 +192,19 @@ describe("ConfigureCommand — settable keys", () => {
 		);
 	});
 
+	it("accepts a free-text summaryLanguage and lists it in help output", async () => {
+		await runConfigure(["--set", "summaryLanguage=Dutch"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ summaryLanguage: "Dutch" }));
+
+		const help = await runConfigureHelp();
+		expect(help).toContain("summaryLanguage");
+	});
+
+	it("removes summaryLanguage via --remove", async () => {
+		await runConfigure(["--remove", "summaryLanguage"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ summaryLanguage: undefined }));
+	});
+
 	it("rejects localAgentTool values that aren't in the allowlist", async () => {
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 		const prevExitCode = process.exitCode;
@@ -395,6 +408,93 @@ describe("ConfigureCommand — settable keys", () => {
 			expect(mockSaveConfig).toHaveBeenCalledWith(
 				expect.objectContaining({ slack: { workspaceUrl: undefined } }),
 			);
+		});
+	});
+
+	describe("azureEndpoint validation", () => {
+		it("accepts a bare resource origin", async () => {
+			await runConfigure(["--set", "azureEndpoint=https://my-resource.openai.azure.com"]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(
+				expect.objectContaining({ azureEndpoint: "https://my-resource.openai.azure.com" }),
+			);
+		});
+
+		it("strips a trailing slash from a bare resource origin", async () => {
+			await runConfigure(["--set", "azureEndpoint=https://my-resource.openai.azure.com/"]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(
+				expect.objectContaining({ azureEndpoint: "https://my-resource.openai.azure.com" }),
+			);
+		});
+
+		// Pins the fix: this used to be truncated to `parsed.origin`, silently
+		// dropping the whole gateway path (an APIM front door exposing the
+		// /openai/v1/chat/completions surface) and breaking `callAzureFoundry`'s
+		// pre-built-URL detection.
+		it("preserves the full path of a gateway/APIM URL instead of truncating to origin", async () => {
+			await runConfigure([
+				"--set",
+				"azureEndpoint=https://gh-ai-gateway.azure-api.net/gh/openai/v1/chat/completions",
+			]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(
+				expect.objectContaining({
+					azureEndpoint: "https://gh-ai-gateway.azure-api.net/gh/openai/v1/chat/completions",
+				}),
+			);
+		});
+
+		it("strips a trailing slash from a gateway URL too", async () => {
+			await runConfigure([
+				"--set",
+				"azureEndpoint=https://gh-ai-gateway.azure-api.net/gh/openai/v1/chat/completions/",
+			]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(
+				expect.objectContaining({
+					azureEndpoint: "https://gh-ai-gateway.azure-api.net/gh/openai/v1/chat/completions",
+				}),
+			);
+		});
+
+		it("rejects a non-https URL", async () => {
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const prevExitCode = process.exitCode;
+			try {
+				await runConfigure(["--set", "azureEndpoint=http://my-resource.openai.azure.com"]);
+				expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("https"));
+				expect(process.exitCode).toBe(1);
+				expect(mockSaveConfig).not.toHaveBeenCalled();
+			} finally {
+				errorSpy.mockRestore();
+				process.exitCode = prevExitCode;
+			}
+		});
+
+		it("rejects a malformed URL", async () => {
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			const prevExitCode = process.exitCode;
+			try {
+				await runConfigure(["--set", "azureEndpoint=not-a-url"]);
+				expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("valid https URL"));
+				expect(process.exitCode).toBe(1);
+				expect(mockSaveConfig).not.toHaveBeenCalled();
+			} finally {
+				errorSpy.mockRestore();
+				process.exitCode = prevExitCode;
+			}
+		});
+
+		it("lists azureEndpoint, azureApiKey, azureDeployment, azureApiVersion in help/description output", async () => {
+			const help = await runConfigureHelp();
+			expect(help).toContain("azureEndpoint");
+			expect(help).toContain("azureApiKey");
+			expect(help).toContain("azureDeployment");
+			expect(help).toContain("azureApiVersion");
+		});
+	});
+
+	describe("aiProvider validation (azure-foundry)", () => {
+		it("accepts azure-foundry as a valid aiProvider value", async () => {
+			await runConfigure(["--set", "aiProvider=azure-foundry"]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ aiProvider: "azure-foundry" }));
 		});
 	});
 

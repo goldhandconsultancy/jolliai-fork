@@ -28,6 +28,12 @@ import { appendTelemetryEvent, type TelemetryEnvelope } from "./TelemetryBuffer.
 import { resolveTelemetryConsent } from "./TelemetryConsent.js";
 import { isTelemetryEventName, type TelemetryEventName } from "./TelemetryEvents.js";
 
+/**
+ * GoldJolli hard-disable switch: when true, telemetry never emits nor flushes.
+ * Keep this centralized so existing and future call sites remain inert.
+ */
+export const TELEMETRY_HARD_DISABLED = true;
+
 /** Envelope schema version — bump only on a breaking envelope-shape change. */
 export const SCHEMA_VERSION = 1;
 
@@ -71,6 +77,20 @@ let context: TelemetryContext | null = null;
  * later call replaces the context (e.g. after sign-in changes the origin).
  */
 export function initTelemetry(init: TelemetryInit): void {
+	if (TELEMETRY_HARD_DISABLED) {
+		const { surface, surfaceVersion } = parseSurface();
+		context = {
+			enabled: false,
+			cwd: init.cwd,
+			installId: init.installId,
+			sessionId: init.sessionId,
+			surface,
+			surfaceVersion,
+			env: resolveTelemetryEnv(init.origin),
+		};
+		return;
+	}
+
 	const consent = resolveTelemetryConsent({
 		config: init.config,
 		env: init.env,
@@ -104,6 +124,7 @@ export function getTelemetryContext(): Readonly<TelemetryContext> | null {
  * guard additionally drops any name that slips through an `as`-cast.
  */
 export function track(eventName: TelemetryEventName, properties: Readonly<Record<string, unknown>> = {}): void {
+	if (TELEMETRY_HARD_DISABLED) return;
 	const ctx = context;
 	if (!ctx || !ctx.enabled) return;
 	if (!isTelemetryEventName(eventName)) return;

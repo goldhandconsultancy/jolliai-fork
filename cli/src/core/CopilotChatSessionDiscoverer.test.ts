@@ -183,6 +183,14 @@ describe("scanCopilotChatSessions", () => {
 		expect(result.sessions).toEqual([]);
 	});
 
+	it("Scan A: maxAgeMs:Infinity accepts a session far older than 48h (back-fill override)", async () => {
+		makeSessionStateEntry({ sid: "s-ancient", folderPath: projectDir, ageHours: 24 * 90 });
+		const { scanCopilotChatSessions } = await import("./CopilotChatSessionDiscoverer.js");
+		const result = await scanCopilotChatSessions(projectDir, { maxAgeMs: Number.POSITIVE_INFINITY });
+		expect(result.sessions).toHaveLength(1);
+		expect(result.sessions[0].sessionId).toBe("s-ancient");
+	});
+
 	// ─── Scan B (chatSessions/) ────────────────────────────────────────────────
 	it("Scan B: returns empty when no workspaceStorage entry matches projectDir", async () => {
 		const { scanCopilotChatSessions } = await import("./CopilotChatSessionDiscoverer.js");
@@ -224,6 +232,15 @@ describe("scanCopilotChatSessions", () => {
 		const { scanCopilotChatSessions } = await import("./CopilotChatSessionDiscoverer.js");
 		const result = await scanCopilotChatSessions(projectDir);
 		expect(result.sessions).toEqual([]);
+	});
+
+	it("Scan B: maxAgeMs:Infinity accepts a session far older than 48h (back-fill override)", async () => {
+		const ws = makeWorkspace("ws1", nativePathToFileUri(projectDir));
+		makeChatSessionsFile(ws, "ancient.jsonl", 24 * 90);
+		const { scanCopilotChatSessions } = await import("./CopilotChatSessionDiscoverer.js");
+		const result = await scanCopilotChatSessions(projectDir, { maxAgeMs: Number.POSITIVE_INFINITY });
+		expect(result.sessions).toHaveLength(1);
+		expect(result.sessions[0].sessionId).toBe("ancient");
 	});
 
 	it("Scan B: skips irrelevant suffixes (.tmp, .log)", async () => {

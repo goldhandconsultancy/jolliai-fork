@@ -1,8 +1,14 @@
 /**
- * CommitAttributor — maps on-disk Claude transcript slices to historical commits.
+ * CommitAttributor — maps on-disk Claude / Copilot Chat transcript slices to
+ * historical commits.
  *
  * Isolated from the live cursor/queue flow. Operates on the offline indexes built
- * by {@link RawTranscriptScanner} and {@link CommitTargetIndex}.
+ * by {@link RawTranscriptScanner} (Claude) and its sibling
+ * `RawCopilotChatTranscriptScanner` (`./RawCopilotChatTranscriptScanner.js`,
+ * Copilot Chat — merged into the same `bySession` map by `BackfillEngine`
+ * before this function ever sees it, so this module doesn't care which
+ * source an entry came from beyond reading its `RawEntry.source` field
+ * through), plus {@link CommitTargetIndex}.
  *
  * Model (v6 — "effective worktree + time window + cursor slicing", which replaced
  * the earlier HIGH-only / opt-in-MEDIUM model). Per target commit C:
@@ -198,7 +204,10 @@ function buildSessions(entries: ReadonlyArray<RawEntry>): SessionTranscript[] {
 			content: e.content as string,
 			...(e.ts ? { timestamp: e.ts } : {}),
 		}));
-		sessions.push({ sessionId, transcriptPath: list[0].transcriptPath, source: "claude", entries: tEntries });
+		// Every entry in `list` came from the same underlying transcript (grouped
+		// by sessionId above), so they share one `source` — safe to read off the
+		// first.
+		sessions.push({ sessionId, transcriptPath: list[0].transcriptPath, source: list[0].source, entries: tEntries });
 	}
 	return sessions;
 }

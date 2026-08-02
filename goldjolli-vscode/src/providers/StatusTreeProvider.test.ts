@@ -1,0 +1,1441 @@
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+const { loadConfigFromDir, getGlobalConfigDir, parseJolliApiKey } = vi.hoisted(
+	() => ({
+		loadConfigFromDir: vi.fn(),
+		getGlobalConfigDir: vi.fn(() => "/home/user/.jolli/jollimemory"),
+		parseJolliApiKey: vi.fn(),
+	}),
+);
+
+const { executeCommand, TreeItem, ThemeIcon, ThemeColor, EventEmitter } =
+	vi.hoisted(() => {
+		const executeCommand = vi.fn().mockResolvedValue(undefined);
+		class TreeItem {
+			label: string;
+			collapsibleState: number;
+			description?: string;
+			iconPath?: unknown;
+			contextValue?: string;
+			tooltip?: unknown;
+			command?: unknown;
+			constructor(label: string, collapsibleState: number) {
+				this.label = label;
+				this.collapsibleState = collapsibleState;
+			}
+		}
+		class ThemeIcon {
+			readonly id: string;
+			readonly color?: unknown;
+			constructor(id: string, color?: unknown) {
+				this.id = id;
+				this.color = color;
+			}
+		}
+		class ThemeColor {
+			readonly id: string;
+			constructor(id: string) {
+				this.id = id;
+			}
+		}
+		class EventEmitter {
+			event = vi.fn();
+			fire = vi.fn();
+			dispose = vi.fn();
+		}
+		return { executeCommand, TreeItem, ThemeIcon, ThemeColor, EventEmitter };
+	});
+
+vi.mock("vscode", () => ({
+	TreeItem,
+	TreeItemCollapsibleState: { None: 0 },
+	ThemeIcon,
+	ThemeColor,
+	EventEmitter,
+	commands: {
+		executeCommand,
+	},
+}));
+
+vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
+	loadConfigFromDir,
+	getGlobalConfigDir,
+}));
+
+vi.mock("../services/JolliPushService.js", () => ({
+	parseJolliApiKey,
+}));
+
+import { StatusStore } from "../stores/StatusStore.js";
+import { StatusTreeProvider } from "./StatusTreeProvider.js";
+
+/**
+ * Test facade: real StatusStore + StatusTreeProvider with the legacy shim
+ * surface (refresh / setWorkerBusy / setMigrating / etc.) forwarded to the
+ * store.  The provider itself no longer carries these methods.
+ */
+function makeStatusProvider(bridge: unknown, authService?: unknown) {
+	const store = new StatusStore(bridge as never, authService as never);
+	const provider = new StatusTreeProvider(store);
+	return {
+		__store: store,
+		getTreeItem: provider.getTreeItem.bind(provider),
+		getChildren: provider.getChildren.bind(provider),
+		serialize: provider.serialize.bind(provider),
+		onDidChangeTreeData: provider.onDidChangeTreeData,
+		dispose: () => provider.dispose(),
+		refresh: () => store.refresh(),
+		setMigrating: (m: boolean) => store.setMigrating(m),
+		setWorkerBusy: (busy: boolean) => store.setWorkerBusy(busy),
+		setExtensionOutdated: (outdated: boolean) =>
+			store.setExtensionOutdated(outdated),
+		setStatus: (status: Parameters<typeof store.setStatus>[0]) =>
+			store.setStatus(status),
+		/** @deprecated no-op, kept for back-compat with legacy test. */
+		setHistoryProvider: () => {},
+	};
+}
+
+function makeStatus(overrides: Record<string, unknown> = {}) {
+	return {
+		enabled: true,
+		claudeHookInstalled: true,
+		gitHookInstalled: true,
+		geminiHookInstalled: false,
+		activeSessions: 2,
+		mostRecentSession: null,
+		summaryCount: 5,
+		orphanBranch: "jollimemory",
+		claudeDetected: true,
+		codexDetected: true,
+		codexEnabled: true,
+		geminiDetected: true,
+		geminiEnabled: false,
+		...overrides,
+	};
+}
+
+describe("StatusTreeProvider", () => {
+	// Snapshot ANTHROPIC_API_KEY across the suite — the warning row and the
+	// provider row both consult it via `resolveLlmCredentialSource`, so a
+	// dev's local env (or a CI runner's accidentally-set var) would otherwise
+	// flip suppression on and off across tests. beforeEach deletes; afterAll
+	// restores so we don't leak the deletion outside this file.
+	const ORIG_ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+
+	beforeEach(() => {
+		executeCommand.mockClear();
+		loadConfigFromDir.mockReset();
+		parseJolliApiKey.mockReset();
+		delete process.env.ANTHROPIC_API_KEY;
+	});
+
+	afterAll(() => {
+		if (ORIG_ANTHROPIC_API_KEY !== undefined) {
+			process.env.ANTHROPIC_API_KEY = ORIG_ANTHROPIC_API_KEY;
+		} else {
+			delete process.env.ANTHROPIC_API_KEY;
+		}
+	});
+
+	it("renders loading, migrating, and disabled states", () => {
+		const provider = makeStatusProvider({
+			cwd: "/repo",
+			getStatus: vi.fn(),
+		} as never);
+
+		expect(provider.getChildren().map((item) => item.label)).toEqual([
+			"Loading...",
+		]);
+
+		provider.setMigrating(true);
+		expect(provider.getChildren().map((item) => item.label)).toEqual([
+			"Migrating memories...",
+		]);
+
+		provider.setMigrating(false);
+		provider.setStatus(makeStatus({ enabled: false }) as never);
+		expect(provider.getChildren()).toEqual([]);
+
+		// Enabled → shows full status immediately
+		provider.setStatus(makeStatus() as never);
+		expect(provider.getChildren().length).toBeGreaterThan(0);
+	});
+
+	it("setHistoryProvider is a no-op (deprecated)", () => {
+		const provider = makeStatusProvider({
+			cwd: "/repo",
+			getStatus: vi.fn(),
+		} as never);
+
+		// Should not throw — the method is a deprecated no-op kept for compatibility
+		expect(() => provider.setHistoryProvider()).not.toThrow();
+	});
+
+	it("refreshes full status, loads config, and adds optional warning rows", async () => {
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: undefined,
+			jolliApiKey: "jolli-key",
+		});
+		parseJolliApiKey.mockReturnValue({
+			u: "https://acme.jolli.app",
+			t: "acme",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		expect(bridge.getStatus).toHaveBeenCalled();
+		expect(loadConfigFromDir).toHaveBeenCalledWith(
+			"/home/user/.jolli/jollimemory",
+		);
+
+		const items = provider.getChildren();
+		// AI Summary Provider row sits between Sessions and the credential
+		// rows so the high-level "who does the AI" question is answered first,
+		// before the per-credential warnings/details. Position chosen to keep
+		// the visual hierarchy infrastructure → telemetry → provider →
+		// details.
+		expect(items.map((item) => item.label)).toEqual([
+			"Hooks",
+			"Sessions",
+			"AI Summary Provider",
+			"Anthropic API Key",
+			"Jolli Site",
+			"Claude Integration",
+			"Codex Integration",
+			"Gemini Integration",
+		]);
+		expect(items[0].description).toBe("4 Git + 2 Claude");
+		// Hooks icon is OK because gitHookInstalled is true
+		expect((items[0].iconPath as { id: string }).id).toBe("check");
+		// Provider row uses dispatcher's resolveLlmCredentialSource — config
+		// here has only jolliApiKey + no aiProvider, so legacy precedence
+		// resolves to jolli-proxy → "Jolli" label.
+		const providerRow = items.find((it) => it.label === "AI Summary Provider");
+		expect(providerRow?.description).toBe("Jolli");
+		expect(providerRow?.command).toEqual({
+			command: "jollimemory.openSettings",
+			title: "Open Settings",
+		});
+		// Anthropic API Key warning still present because aiProvider is
+		// undefined (legacy config) — the suppression only kicks in when the
+		// user has explicitly chosen Jolli.
+		const apiKeyRow = items.find((it) => it.label === "Anthropic API Key");
+		expect(apiKeyRow?.command).toEqual({
+			command: "jollimemory.openSettings",
+			title: "Open Settings",
+		});
+		expect(items.find((it) => it.label === "Jolli Site")?.description).toBe(
+			"acme.jolli.app",
+		);
+	});
+
+	it("suppresses the Anthropic API Key warning when aiProvider is explicitly 'jolli'", async () => {
+		// Pinned because this is the user-driven product change: choosing
+		// Jolli on the AI Summary tab in Settings should silence the
+		// "Anthropic API key not configured" nag — it contradicts the choice
+		// they just made. Legacy configs (aiProvider undefined) keep the
+		// nag (covered by the test above).
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: undefined,
+			jolliApiKey: "jolli-key",
+			aiProvider: "jolli",
+		});
+		parseJolliApiKey.mockReturnValue({
+			u: "https://acme.jolli.app",
+			t: "acme",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const labels = items.map((it) => it.label);
+		expect(labels).not.toContain("Anthropic API Key");
+		// Provider row still present, showing the explicit choice.
+		expect(
+			items.find((it) => it.label === "AI Summary Provider")?.description,
+		).toBe("Jolli");
+	});
+
+	it("suppresses the Anthropic API Key warning when ANTHROPIC_API_KEY env is set", async () => {
+		// Without this suppression, an env-only setup contradicts itself in
+		// the same tree: the AI Summary Provider row reports "Anthropic
+		// (env) ✓" via resolveLlmCredentialSource, while the warning row
+		// would still claim the key is missing. Both rows consult the same
+		// env var so the verdict has to match.
+		process.env.ANTHROPIC_API_KEY = "sk-ant-env-only";
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: undefined,
+			jolliApiKey: undefined,
+			aiProvider: undefined,
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const labels = items.map((it) => it.label);
+		expect(labels).not.toContain("Anthropic API Key");
+		const providerRow = items.find((it) => it.label === "AI Summary Provider");
+		expect(providerRow?.description).toBe("Anthropic (env)");
+	});
+
+	it("provider row warns when aiProvider='jolli' but no jolliApiKey is on file", async () => {
+		// Strict-honor edge case: dispatcher returns null for this combination,
+		// so the row must surface the gap rather than silently showing a
+		// happy-path label. Without this, the user could pick Jolli, sign out,
+		// and never realize summaries would now fail to dispatch.
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: "sk-ant-still-here",
+			aiProvider: "jolli",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const providerRow = items.find((it) => it.label === "AI Summary Provider");
+		expect(providerRow?.description).toBe("not configured — click to set");
+		expect((providerRow?.iconPath as { id: string }).id).toBe("warning");
+	});
+
+	it("provider row shows 'Local agent' (not 'not configured') when aiProvider='local-agent'", async () => {
+		// Regression: the provider-row switch had no `case "local-agent"`, so a
+		// resolved local-agent source fell into the default → "not configured",
+		// even though the dispatcher would happily drive the local CLI agent.
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: "sk-ant-present-but-ignored",
+			aiProvider: "local-agent",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const providerRow = provider
+			.getChildren()
+			.find((it) => it.label === "AI Summary Provider");
+		expect(providerRow?.description).toBe("Local agent");
+		expect((providerRow?.iconPath as { id: string }).id).not.toBe("warning");
+	});
+
+	it("provider row warns with the Anthropic-specific tooltip when aiProvider='anthropic' but no key is on file", async () => {
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: undefined,
+			jolliApiKey: undefined,
+			aiProvider: "anthropic",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const providerRow = provider
+			.getChildren()
+			.find((it) => it.label === "AI Summary Provider");
+		expect(providerRow?.description).toBe("not configured — click to set");
+		expect((providerRow?.iconPath as { id: string }).id).toBe("warning");
+		expect(providerRow?.tooltip).toContain(
+			"Provider is set to Anthropic but no API key is configured.",
+		);
+	});
+
+	it("tracks worker busy state and sign-in prompt when no Jolli credentials", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({ codexEnabled: false, geminiEnabled: true }),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: "anthropic",
+			jolliApiKey: undefined,
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+
+		await provider.refresh();
+		provider.setWorkerBusy(true);
+
+		const items = provider.getChildren();
+		expect(items.map((item) => item.label)).toContain(
+			"AI summary in progress…",
+		);
+		expect(
+			items.find((item) => item.label === "Codex Integration")?.description,
+		).toBe("detected but disabled");
+		expect(
+			items.find((item) => item.label === "Gemini Integration")?.description,
+		).toBe("hook not installed");
+		// No Jolli credentials → shows sign-in prompt (replaced former "Jolli API Key" warning)
+		expect(
+			items.find((item) => item.label === "Jolli Account")?.command,
+		).toEqual({
+			command: "jollimemory.signIn",
+			title: "Sign In",
+		});
+	});
+
+	it("getTreeItem returns the element directly", () => {
+		const provider = makeStatusProvider({
+			cwd: "/repo",
+			getStatus: vi.fn(),
+		} as never);
+		const items = provider.getChildren();
+		const item = items[0]; // "Loading..." item
+
+		expect(provider.getTreeItem(item)).toBe(item);
+	});
+
+	it("shows X icon when gitHookInstalled is false even if Claude hooks are present", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					claudeHookInstalled: true,
+					gitHookInstalled: false,
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const hooksItem = items.find((item) => item.label === "Hooks");
+		expect(hooksItem?.description).toBe("2 Claude");
+		// Hooks icon is X because git hooks are not installed
+		expect((hooksItem?.iconPath as { id: string }).id).toBe("x");
+	});
+
+	it("shows OK icon when git hooks installed even if Gemini hooks missing", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					gitHookInstalled: true,
+					claudeHookInstalled: true,
+					geminiDetected: true,
+					geminiHookInstalled: false,
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const hooksItem = items.find((item) => item.label === "Hooks");
+		expect(hooksItem?.description).toBe("4 Git + 2 Claude");
+		// Hooks icon is OK because git hooks are installed (Gemini hook status doesn't affect it)
+		expect((hooksItem?.iconPath as { id: string }).id).toBe("check");
+	});
+
+	it("renders singular session tooltip and partial hook states", async () => {
+		// Covers the activeSessions === 1 branch (no "s") on line 180,
+		// and individual hook installed/not-installed branches on lines 175-178.
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					activeSessions: 1,
+					claudeHookInstalled: false,
+					gitHookInstalled: true,
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key", jolliApiKey: "jk" });
+		parseJolliApiKey.mockReturnValue(null);
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const hooksItem = items.find((item) => item.label === "Hooks");
+		expect(hooksItem?.description).toBe("4 Git");
+
+		const sessionsItem = items.find((item) => item.label === "Sessions");
+		expect(sessionsItem?.description).toBe("1");
+	});
+
+	it("shows Jolli Site only when parseJolliApiKey returns a URL with siteUrl", async () => {
+		// Covers both `if (meta?.u)` branches: signed in with jolliApiKey, but the
+		// parsed metadata lacks `u`, so the Jolli Site row is NOT appended.
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () => makeStatus()),
+		};
+		// authToken makes the "signed in" branch active so execution reaches line 247.
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: "key",
+			authToken: "tok",
+			jolliApiKey: "jk",
+		});
+		// Return meta without u field — no Jolli Site row
+		parseJolliApiKey.mockReturnValue({ t: "acme" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		expect(items.find((item) => item.label === "Jolli Site")).toBeUndefined();
+	});
+
+	it("shows Jolli Site from persisted jolliUrl when signed in but no key was issued", async () => {
+		// Regression guard for P2b: the Settings panel and `jolli status` fall
+		// back to config.jolliUrl in the "signed in, key not issued / cleared"
+		// state. The STATUS tree must agree instead of showing nothing.
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: "key",
+			authToken: "tok",
+			jolliApiKey: undefined,
+			jolliUrl: "https://tenant1.jolli.ai",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const siteRow = items.find((item) => item.label === "Jolli Site");
+		expect(siteRow?.description).toBe("tenant1.jolli.ai");
+		// The "not issued — pushes disabled" warning is still shown alongside it.
+		expect(items.find((item) => item.label === "Jolli API Key")?.description).toBe(
+			"not issued — pushes disabled",
+		);
+	});
+
+	it("falls back to jolliUrl for the Jolli Site row when the key is undecodable", async () => {
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: "key",
+			authToken: "tok",
+			jolliApiKey: "legacy-hand-typed",
+			jolliUrl: "https://tenant1.jolli.ai",
+		});
+		// Undecodable / legacy key — no embedded tenant.
+		parseJolliApiKey.mockReturnValue(null);
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		expect(items.find((item) => item.label === "Jolli Site")?.description).toBe("tenant1.jolli.ai");
+	});
+
+	it("loads config even when disabled, but renders no rows", async () => {
+		// Auth state (authToken / apiKey) is independent of whether hooks are
+		// installed — keeping config loaded while disabled lets the Sidebar's
+		// onboarding gate stay accurate, even though this provider itself
+		// surfaces no rows in the disabled state.
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () => makeStatus({ enabled: false })),
+		};
+		loadConfigFromDir.mockResolvedValue({});
+		const provider = makeStatusProvider(bridge as never);
+
+		await provider.refresh();
+
+		expect(loadConfigFromDir).toHaveBeenCalled();
+		expect(provider.getChildren()).toEqual([]);
+	});
+
+	it("includes Gemini CLI in hooks description when geminiHookInstalled is true", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					gitHookInstalled: true,
+					claudeHookInstalled: true,
+					geminiHookInstalled: true,
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const hooksItem = items.find((item) => item.label === "Hooks");
+		expect(hooksItem?.description).toBe("4 Git + 2 Claude + 1 Gemini CLI");
+	});
+
+	it("shows 'none installed' when no hooks are installed", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					gitHookInstalled: false,
+					claudeHookInstalled: false,
+					geminiHookInstalled: false,
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const hooksItem = items.find((item) => item.label === "Hooks");
+		expect(hooksItem?.description).toBe("none installed");
+	});
+
+	it("shows hookRuntime in Hooks tooltip when hookSource is defined", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({ hookSource: "vscode-extension", hookVersion: "1.2.3" }),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		// Hook runtime should appear in the Hooks tooltip, not as a separate row
+		const hooksItem = items.find((item) => item.label === "Hooks");
+		expect(String(hooksItem?.tooltip)).toContain("vscode-extension@1.2.3");
+		expect(items.find((item) => item.label === "Managed by")).toBeUndefined();
+	});
+
+	it("omits version suffix from hookRuntime tooltip when hookVersion is 'unknown'", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({ hookSource: "cli", hookVersion: "unknown" }),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const hooksItem = items.find((item) => item.label === "Hooks");
+		expect(String(hooksItem?.tooltip)).toContain("Hook runtime: cli");
+		expect(String(hooksItem?.tooltip)).not.toContain("cli@");
+	});
+
+	it("shows 'Update Available' item when extensionOutdated is true", async () => {
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		// setExtensionOutdated fires a tree change
+		provider.setExtensionOutdated(true);
+		const items = provider.getChildren();
+		const updateItem = items.find((item) => item.label === "Update Available");
+		expect(updateItem).toBeDefined();
+		expect(updateItem?.description).toBe("a newer version is available");
+	});
+
+	// ── Session count suffixes ────────────────────────────────────────────
+
+	it("appends plural session counts to integration descriptions", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({ sessionsBySource: { claude: 3, codex: 2 } }),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const claude = items.find((item) => item.label === "Claude Integration");
+		expect(claude?.description).toBe("hook installed (3 sessions)");
+		const codex = items.find((item) => item.label === "Codex Integration");
+		expect(codex?.description).toBe("detected & enabled (2 sessions)");
+	});
+
+	it("appends singular session count to integration description", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({ sessionsBySource: { claude: 1 } }),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const claude = items.find((item) => item.label === "Claude Integration");
+		expect(claude?.description).toBe("hook installed (1 session)");
+	});
+
+	// ── OpenCode scan error (Finding P1-b) ────────────────────────────────
+
+	it("renders an 'unavailable' OpenCode row when openCodeScanError is present", async () => {
+		// Regression: a corrupt/locked OpenCode DB used to render as
+		// "detected & enabled (0 sessions)" — visually identical to a healthy
+		// integration with no activity. Now the scan error replaces the normal row.
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					openCodeDetected: true,
+					openCodeEnabled: true,
+					openCodeScanError: {
+						kind: "corrupt",
+						message: "SQLITE_CORRUPT: disk image malformed",
+					},
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const openCode = items.find(
+			(item) => item.label === "OpenCode Integration",
+		);
+		expect(openCode?.description).toBe("unavailable — corrupt");
+		expect(String(openCode?.tooltip)).toContain("SQLITE_CORRUPT");
+	});
+
+	it("falls back to the normal detected/enabled OpenCode row when no scan error", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					openCodeDetected: true,
+					openCodeEnabled: true,
+					sessionsBySource: { opencode: 2 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const openCode = items.find(
+			(item) => item.label === "OpenCode Integration",
+		);
+		expect(openCode?.description).toBe("detected & enabled (2 sessions)");
+	});
+
+	// ── Cursor scan error / healthy row ───────────────────────────────────
+
+	it("renders an 'unavailable' Cursor row when cursorScanError is present", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					cursorDetected: true,
+					cursorEnabled: true,
+					cursorScanError: {
+						kind: "locked",
+						message: "database is locked",
+					},
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const cursor = items.find((item) => item.label === "Cursor Integration");
+		expect(cursor?.description).toBe("unavailable — locked");
+		expect(String(cursor?.tooltip)).toContain("database is locked");
+	});
+
+	it("falls back to the normal detected/enabled Cursor row when no scan error", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					cursorDetected: true,
+					cursorEnabled: true,
+					sessionsBySource: { cursor: 3 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const cursor = items.find((item) => item.label === "Cursor Integration");
+		expect(cursor?.description).toBe("detected & enabled (3 sessions)");
+	});
+
+	// ── Devin scan error / healthy row ────────────────────────────────────
+
+	it("renders an 'unavailable' Devin row when devinScanError is present", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					devinDetected: true,
+					devinEnabled: true,
+					devinScanError: {
+						kind: "locked",
+						message: "database is locked",
+					},
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const devin = items.find((item) => item.label === "Devin Integration");
+		expect(devin?.description).toBe("unavailable — locked");
+		expect(String(devin?.tooltip)).toContain("database is locked");
+	});
+
+	it("falls back to the normal detected/enabled Devin row when no scan error", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					devinDetected: true,
+					devinEnabled: true,
+					sessionsBySource: { devin: 2 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const devin = items.find((item) => item.label === "Devin Integration");
+		expect(devin?.description).toBe("detected & enabled (2 sessions)");
+	});
+
+	// ── Cursor CLI shares the Cursor toggle (merged, Copilot-style) ─────────
+
+	it("renders a separate 'Cursor CLI' warn row when cursorCliScanError is present", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					cursorCliDetected: true,
+					cursorEnabled: true,
+					cursorCliScanError: {
+						kind: "fs",
+						message: "permission denied",
+					},
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const cursorCli = items.find((item) => item.label === "Cursor CLI");
+		expect(cursorCli?.description).toBe("unavailable — fs");
+		expect(String(cursorCli?.tooltip)).toContain("permission denied");
+		// No standalone "Cursor CLI Integration" row anymore.
+		expect(items.find((item) => item.label === "Cursor CLI Integration")).toBeUndefined();
+	});
+
+	it("merges cursor + cursor-cli sessions into a single Cursor row under the shared toggle", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					cursorDetected: true,
+					cursorCliDetected: true,
+					cursorEnabled: true,
+					sessionsBySource: { cursor: 3, "cursor-cli": 4 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const cursor = items.find((item) => item.label === "Cursor Integration");
+		expect(cursor?.description).toBe("detected & enabled (7 sessions)");
+		expect(String(cursor?.tooltip)).toContain("IDE: ✓, CLI: ✓");
+		expect(items.find((item) => item.label === "Cursor CLI Integration")).toBeUndefined();
+	});
+
+	it("keeps the Cursor row detected when only the cursor-agent CLI is present", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					cursorDetected: false,
+					cursorCliDetected: true,
+					cursorEnabled: true,
+					sessionsBySource: { "cursor-cli": 4 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const cursor = items.find((item) => item.label === "Cursor Integration");
+		expect(cursor?.description).toBe("detected & enabled (4 sessions)");
+		expect(String(cursor?.tooltip)).toContain("IDE: ✗, CLI: ✓");
+	});
+
+	// ── Antigravity scan error / healthy row ──────────────────────────────
+
+	it("renders an 'unavailable' Antigravity row when antigravityScanError is present", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					antigravityDetected: true,
+					antigravityEnabled: true,
+					antigravityScanError: {
+						kind: "corrupt",
+						message: "file is not a database",
+					},
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const row = items.find((item) => item.label === "Antigravity Integration");
+		expect(row?.description).toBe("unavailable — corrupt");
+		expect(String(row?.tooltip)).toContain("file is not a database");
+	});
+
+	it("falls back to the normal detected/enabled Antigravity row when no scan error", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					antigravityDetected: true,
+					antigravityEnabled: true,
+					sessionsBySource: { antigravity: 2 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const row = items.find((item) => item.label === "Antigravity Integration");
+		expect(row?.description).toBe("detected & enabled (2 sessions)");
+	});
+
+	// ── Copilot scan error ────────────────────────────────────────────────
+
+	it("shows Copilot Integration row when detected and enabled", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					copilotDetected: true,
+					copilotEnabled: true,
+					sessionsBySource: { copilot: 2 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const item = items.find((i) => i.label === "Copilot Integration");
+		expect(item).toBeDefined();
+		expect(item?.description).toContain("2");
+	});
+
+	it("shows Copilot Integration as unavailable when scan errors", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					copilotDetected: true,
+					copilotEnabled: true,
+					copilotScanError: { kind: "locked", message: "database is locked" },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const item = items.find((i) => i.label === "Copilot Integration");
+		expect(item?.description).toContain("locked");
+		expect(String(item?.tooltip)).toContain("Copilot CLI database scan failed");
+	});
+
+	it("Copilot row tooltip distinguishes CLI / Chat detection", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					copilotDetected: true,
+					copilotChatDetected: false,
+					copilotEnabled: true,
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const copilotItem = items.find(
+			(i) => typeof i.label === "string" && i.label.includes("Copilot"),
+		);
+		expect(String(copilotItem?.tooltip)).toContain("CLI: ✓");
+		expect(String(copilotItem?.tooltip)).toContain("Chat: ✗");
+	});
+
+	it("Copilot row detected = true when only Chat is detected", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					copilotDetected: false,
+					copilotChatDetected: true,
+					copilotEnabled: true,
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const copilotItem = items.find((i) => i.label === "Copilot Integration");
+		// Item is rendered with detected=true (e.g. shows "available" rather than "not detected")
+		expect(copilotItem).toBeDefined();
+		expect(String(copilotItem?.description)).not.toContain("not detected");
+	});
+
+	it("shows independent warn rows for each Copilot form scan error and still renders integration row", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					copilotDetected: false,
+					copilotChatDetected: true,
+					copilotEnabled: true,
+					copilotScanError: { kind: "locked", message: "db is locked" },
+					copilotChatScanError: {
+						kind: "io",
+						message: "workspace dir unreadable",
+					},
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const cliWarn = items.find(
+			(i) =>
+				i.label === "Copilot Integration" &&
+				String(i.description).includes("locked"),
+		);
+		const chatWarn = items.find((i) => i.label === "Copilot Chat");
+		const integration = items.find(
+			(i) =>
+				i.label === "Copilot Integration" && String(i.tooltip).includes("CLI:"),
+		);
+		expect(cliWarn).toBeDefined();
+		expect(chatWarn).toBeDefined();
+		expect(String(chatWarn?.tooltip)).toContain("Copilot Chat scan failed");
+		expect(integration).toBeDefined();
+		expect(String(integration?.tooltip)).toContain("Chat: ✓");
+	});
+
+	// ── Cline integration ─────────────────────────────────────────────────
+
+	it("shows Cline Integration row when detected and enabled", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					clineDetected: true,
+					clineEnabled: true,
+					sessionsBySource: { cline: 2, "cline-cli": 3 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const item = items.find((i) => i.label === "Cline Integration");
+		expect(item).toBeDefined();
+		expect(item?.description).toContain("5");
+	});
+
+	it("Cline row tooltip distinguishes CLI / VS Code detection", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					clineDetected: true,
+					clineCliDetected: true,
+					clineVscodeDetected: false,
+					clineEnabled: true,
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const clineItem = items.find((i) => i.label === "Cline Integration");
+		expect(String(clineItem?.tooltip)).toContain("CLI: ✓");
+		expect(String(clineItem?.tooltip)).toContain("VS Code: ✗");
+	});
+
+	it("surfaces a VS Code scan error as a warn row without masking the healthy CLI", async () => {
+		// Regression (JOLLI-2034): a single collapsed clineScanError REPLACED the
+		// main Cline row, hiding the healthy CLI. The VS Code failure now surfaces
+		// as its own warn row while the merged "detected & enabled" row still shows.
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					clineDetected: true,
+					clineCliDetected: true,
+					clineVscodeDetected: true,
+					clineEnabled: true,
+					clineVscodeScanError: { kind: "parse", message: "bad task json" },
+					sessionsBySource: { "cline-cli": 3 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const warnRow = items.find(
+			(i) => i.label === "Cline Integration" && String(i.description).includes("unavailable"),
+		);
+		expect(warnRow?.description).toBe("unavailable — parse");
+		expect(String(warnRow?.tooltip)).toContain("Cline VS Code scan failed");
+		// The merged row still renders the healthy CLI's session count.
+		const healthyRow = items.find(
+			(i) => i.label === "Cline Integration" && String(i.tooltip).includes("CLI: ✓"),
+		);
+		expect(healthyRow?.description).toBe("detected & enabled (3 sessions)");
+	});
+
+	it("renders a separate 'Cline CLI' warn row when clineCliScanError is present", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					clineDetected: true,
+					clineCliDetected: true,
+					clineVscodeDetected: true,
+					clineEnabled: true,
+					clineCliScanError: { kind: "fs", message: "permission denied" },
+					sessionsBySource: { cline: 2 },
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const cliWarn = items.find((i) => i.label === "Cline CLI");
+		expect(cliWarn?.description).toBe("unavailable — fs");
+		expect(String(cliWarn?.tooltip)).toContain("permission denied");
+		// Main row unaffected.
+		const healthyRow = items.find(
+			(i) => i.label === "Cline Integration" && String(i.description).includes("detected & enabled"),
+		);
+		expect(healthyRow?.description).toBe("detected & enabled (2 sessions)");
+	});
+
+	// ── Auth-aware status rows ────────────────────────────────────────────
+
+	it("shows Jolli Account connected when authToken is present", async () => {
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: "key",
+			authToken: "some-auth-token",
+			jolliApiKey: "sk-jol-test",
+		});
+		parseJolliApiKey.mockReturnValue({
+			u: "https://acme.jolli.app",
+			t: "acme",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const accountItem = items.find((item) => item.label === "Jolli Account");
+		expect(accountItem).toBeDefined();
+		expect(accountItem?.description).toBe("connected");
+		expect((accountItem?.iconPath as { id: string }).id).toBe("check");
+
+		// Also shows Jolli Site when key has metadata
+		const siteItem = items.find((item) => item.label === "Jolli Site");
+		expect(siteItem).toBeDefined();
+		expect(siteItem?.description).toBe("acme.jolli.app");
+	});
+
+	it("warns about missing Jolli API Key when authToken is present but jolliApiKey is not", async () => {
+		// Partial-auth state: /api/auth/cli-token returned a session token but no
+		// jolli_api_key. The panel should still show Jolli Account as connected
+		// (sign-in succeeded) AND surface a clickable warning so the user isn't
+		// silently left with a broken push setup.
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({
+			apiKey: "key",
+			authToken: "some-auth-token",
+		});
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const accountItem = items.find((item) => item.label === "Jolli Account");
+		expect(accountItem?.description).toBe("connected");
+
+		const keyItem = items.find((item) => item.label === "Jolli API Key");
+		expect(keyItem).toBeDefined();
+		expect(keyItem?.description).toBe("not issued — pushes disabled");
+		expect((keyItem?.iconPath as { id: string }).id).toBe("warning");
+		expect(keyItem?.command).toEqual({
+			command: "jollimemory.openSettings",
+			title: "Open Settings",
+		});
+
+		// No Jolli Site row when the API key is absent.
+		expect(items.find((item) => item.label === "Jolli Site")).toBeUndefined();
+	});
+
+	it("shows Jolli Account sign-in prompt when no credentials", async () => {
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const accountItem = items.find((item) => item.label === "Jolli Account");
+		expect(accountItem).toBeDefined();
+		expect(accountItem?.description).toBe("not connected — click to sign in");
+		expect((accountItem?.iconPath as { id: string }).id).toBe("warning");
+		expect(accountItem?.command).toEqual({
+			command: "jollimemory.signIn",
+			title: "Sign In",
+		});
+	});
+
+	it("calls authService.refreshContextKey when config is loaded", async () => {
+		const mockAuthService = { refreshContextKey: vi.fn() };
+		const bridge = { cwd: "/repo", getStatus: vi.fn(async () => makeStatus()) };
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key", authToken: "token" });
+
+		const provider = makeStatusProvider(
+			bridge as never,
+			mockAuthService as never,
+		);
+		await provider.refresh();
+
+		expect(mockAuthService.refreshContextKey).toHaveBeenCalledWith({
+			apiKey: "key",
+			authToken: "token",
+		});
+	});
+
+	it("calls authService.refreshContextKey when disabled with the on-disk config", async () => {
+		// `jollimemory.signedIn` context key reflects whether the user is
+		// signed in, not whether hooks are installed — so disable must not
+		// stop us from syncing it. Otherwise the context key drifts stale
+		// after a disable and any when-clauses gating on it lie to the user.
+		const mockAuthService = { refreshContextKey: vi.fn() };
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () => makeStatus({ enabled: false })),
+		};
+		loadConfigFromDir.mockResolvedValue({ authToken: "t" });
+
+		const provider = makeStatusProvider(
+			bridge as never,
+			mockAuthService as never,
+		);
+		await provider.refresh();
+
+		expect(mockAuthService.refreshContextKey).toHaveBeenCalledWith({
+			authToken: "t",
+		});
+	});
+
+	it("skips integration row when claudeDetected is false", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					claudeDetected: false,
+					codexDetected: false,
+					geminiDetected: false,
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		expect(
+			items.find((item) => item.label === "Claude Integration"),
+		).toBeUndefined();
+		expect(
+			items.find((item) => item.label === "Codex Integration"),
+		).toBeUndefined();
+		expect(
+			items.find((item) => item.label === "Gemini Integration"),
+		).toBeUndefined();
+	});
+
+	it("getWorkerBusy reflects the underlying store's worker-busy flag", () => {
+		const provider = makeStatusProvider({
+			cwd: "/repo",
+			getStatus: vi.fn(),
+		} as never);
+
+		// Use the inner provider directly — the facade doesn't expose getWorkerBusy
+		// because legacy tests didn't need it; the production code path does.
+		const tree = new StatusTreeProvider(provider.__store);
+		expect(tree.getWorkerBusy()).toBe(false);
+		provider.__store.setWorkerBusy(true);
+		expect(tree.getWorkerBusy()).toBe(true);
+		tree.dispose();
+	});
+
+	it("dispose unsubscribes from the store and disposes the change emitter", () => {
+		const provider = makeStatusProvider({
+			cwd: "/repo",
+			getStatus: vi.fn(),
+		} as never);
+
+		// Spy on the store's onChange to confirm the unsubscribe returned by it
+		// is invoked exactly once when the provider disposes.
+		const unsubscribe = vi.fn();
+		const onChange = vi
+			.spyOn(provider.__store, "onChange")
+			.mockImplementation(() => unsubscribe);
+		const tree = new StatusTreeProvider(provider.__store);
+		expect(onChange).toHaveBeenCalledTimes(1);
+
+		tree.dispose();
+		expect(unsubscribe).toHaveBeenCalledTimes(1);
+	});
+
+	describe("StatusTreeProvider.serialize", () => {
+		it("returns [] when status is disabled", () => {
+			const provider = makeStatusProvider({
+				cwd: "/repo",
+				getStatus: vi.fn(),
+			} as never);
+			provider.setStatus(makeStatus({ enabled: false }) as never);
+			expect(provider.serialize()).toEqual([]);
+		});
+
+		it("returns a single 'Migrating memories...' entry when migrating", () => {
+			const provider = makeStatusProvider({
+				cwd: "/repo",
+				getStatus: vi.fn(),
+			} as never);
+			provider.setMigrating(true);
+			const out = provider.serialize();
+			expect(out).toHaveLength(1);
+			expect(out[0].label).toBe("Migrating memories...");
+			expect(out[0].iconKey).toBe("loading~spin");
+		});
+
+		it("serializes a Hooks entry with description and tooltip", async () => {
+			const bridge = {
+				cwd: "/repo",
+				getStatus: vi.fn(async () =>
+					makeStatus({ gitHookInstalled: true, claudeHookInstalled: true }),
+				),
+			};
+			loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+			const provider = makeStatusProvider(bridge as never);
+			await provider.refresh();
+
+			const out = provider.serialize();
+			const hooks = out.find((e) => e.label === "Hooks");
+			expect(hooks).toBeDefined();
+			expect(hooks?.iconKey).toBe("check");
+			expect(hooks?.iconColor).toBe("charts.green");
+			expect(hooks?.description).toContain("Git");
+			expect(hooks?.tooltip).toContain("Git hooks");
+		});
+
+		it("includes a click command on the API key warning row", async () => {
+			const bridge = {
+				cwd: "/repo",
+				getStatus: vi.fn(async () => makeStatus()),
+			};
+			loadConfigFromDir.mockResolvedValue({ apiKey: undefined });
+
+			const provider = makeStatusProvider(bridge as never);
+			await provider.refresh();
+
+			const out = provider.serialize();
+			const apiKey = out.find((e) => e.label === "Anthropic API Key");
+			expect(apiKey?.command?.command).toBe("jollimemory.openSettings");
+		});
+	});
+});

@@ -4,7 +4,8 @@
  * Fully isolated from the live post-commit pipeline (QueueWorker / sessions.json
  * / cursors.json). For a list of candidate commit hashes it:
  *   1. drops the ones that already have a summary;
- *   2. scans on-disk Claude transcripts and the repo's real-commit index;
+ *   2. scans on-disk Claude transcripts and (unless `copilotEnabled === false`)
+ *      VS Code Copilot Chat transcripts, plus the repo's real-commit index;
  *   3. attributes transcript slices to commits ({@link attributeCommits});
  *   4. for each confidently-attributed commit, reuses the SAME summary
  *      generation + storage path as the live flow (`generateSummary` /
@@ -26,9 +27,10 @@ import { generateTranscriptId } from "../core/TranscriptId.js";
 import { buildMultiSessionContext } from "../core/TranscriptReader.js";
 import { launchWorker } from "../hooks/QueueWorker.js";
 import { createLogger } from "../Logger.js";
-import { type CommitSummary, CURRENT_SCHEMA_VERSION, type StoredTranscript } from "../Types.js";
+import { type CommitSummary, CURRENT_SCHEMA_VERSION, type LlmConfig, type StoredTranscript } from "../Types.js";
 import { type AttributedCommit, attributeCommits } from "./CommitAttributor.js";
 import { buildCommitTargetIndex, type CommitTargetIndex } from "./CommitTargetIndex.js";
+import { scanCopilotChatTranscriptsForBackfill } from "./RawCopilotChatTranscriptScanner.js";
 import { cwdInRoots, scanClaudeTranscripts } from "./RawTranscriptScanner.js";
 
 const log = createLogger("BackfillEngine");
@@ -132,6 +134,17 @@ export interface BackfillOptions {
 	 * door's Ctrl-C handler to make a long back-fill interruptible + resumable.
 	 */
 	readonly signal?: AbortSignal;
+	/**
+	 * Regenerate `hashes` even if they already have a summary — bypasses step 1's
+	 * "already summarized" skip and threads through to `storeSummary`'s own
+	 * `force` parameter (which already existed for this purpose; back-fill just
+	 * never exposed it). For an explicit, small `--hashes` list ONLY: the
+	 * default `--last N` / `--all` flows never set this, so normal back-fill
+	 * runs keep skipping already-summarized commits. Meant for a deliberate
+	 * "redo this commit" ask — e.g. after fixing a transcript-source reader bug
+	 * that caused a real conversation to be missed the first time.
+	 */
+	readonly force?: boolean;
 }
 
 /** Returns the repo's worktree roots (for scoping transcripts by cwd). */
@@ -173,15 +186,16 @@ async function generateAndStore(
 	hash: string,
 	attr: AttributedCommit | null,
 	cwd: string,
-	llmConfig: {
-		apiKey?: string;
-		model?: string;
-		jolliApiKey?: string;
-		aiProvider?: "anthropic" | "jolli" | "local-agent";
-		localAgentTool?: "claude-code";
-		localAgentPath?: string;
-	},
+	// `LlmConfig` (Types.ts) is the single source of truth for "which config
+	// fields an LLM call needs" — used verbatim rather than a hand-copied
+	// field list so a new dimension (e.g. `summaryLanguage`) reaches backfill
+	// automatically instead of silently landing in every OTHER call path
+	// while backfill quietly keeps generating in the old form. This is the
+	// second time a hand-copied list here went stale (the Azure fields were
+	// the first); don't reintroduce a third copy.
+	llmConfig: LlmConfig,
 	storage: StorageProvider,
+	force = false,
 ): Promise<number> {
 	const commitInfo = await getCommitInfo(hash, cwd);
 	const diff = await getDiffContent(`${hash}~1`, hash, cwd);
@@ -231,7 +245,7 @@ async function generateAndStore(
 	// Only attach a transcript artifact when a conversation was attributed.
 	const artifacts =
 		attr && transcriptId ? { transcript: { id: transcriptId, data: toStoredTranscript(attr) } } : undefined;
-	await storeSummary(summary, cwd, false, artifacts, storage);
+	await storeSummary(summary, cwd, force, artifacts, storage);
 	return result.topics.length;
 }
 
@@ -249,19 +263,28 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 		onProgress,
 		onCommitStart,
 		signal,
+		force = false,
 	} = opts;
 	const outcomes: BackfillOutcome[] = [];
 
-	log.info("Back-fill start: cwd=%s candidates=%d dryRun=%s minTier=%s", cwd, hashes.length, dryRun, minTier);
+	log.info(
+		"Back-fill start: cwd=%s candidates=%d dryRun=%s minTier=%s force=%s",
+		cwd,
+		hashes.length,
+		dryRun,
+		minTier,
+		force,
+	);
 
 	const storage = await createStorage(cwd, cwd);
 	setActiveStorage(storage);
 
-	// 1. Drop commits that already have a summary.
+	// 1. Drop commits that already have a summary (skipped entirely when
+	// `force` — see BackfillOptions.force).
 	const existing = await getIndexEntryMap(cwd, storage);
 	const missing: string[] = [];
 	for (const h of hashes) {
-		if (existing.has(h)) outcomes.push({ commitHash: h, status: "skipped-has-summary" });
+		if (!force && existing.has(h)) outcomes.push({ commitHash: h, status: "skipped-has-summary" });
 		else missing.push(h);
 	}
 	log.info("Back-fill: %d/%d commits lack a summary", missing.length, hashes.length);
@@ -271,9 +294,23 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 		return summarize(hashes.length, outcomes);
 	}
 
-	// 2. Build offline indexes.
+	// Loaded once, up-front: gates the Copilot Chat scan below (step 2) AND
+	// supplies the LLM credentials for generation (step 4).
+	const config = await loadConfig();
+
+	// 2. Build offline indexes. Claude is always scanned; Copilot Chat is merged
+	// in unless the user explicitly disabled it (`copilotEnabled === false`),
+	// matching the live post-commit flow's gate (QueueWorker.loadSessionTranscripts).
+	// Unlike the live flow — and unlike Copilot Chat's own 48h-staleness discovery
+	// used there — back-fill needs every historical session regardless of age, so
+	// it calls `scanCopilotChatTranscriptsForBackfill` (no staleness cutoff) rather
+	// than `discoverCopilotChatSessions`.
 	const roots = await worktreeRoots(cwd);
 	const bySession = await scanClaudeTranscripts(cwdInRoots(roots), projectsRoot);
+	if (config.copilotEnabled !== false) {
+		const copilotSessions = await scanCopilotChatTranscriptsForBackfill(roots);
+		for (const [sessionId, entries] of copilotSessions) bySession.set(sessionId, entries);
+	}
 	const index = await buildCommitTargetIndex(cwd);
 	log.info(
 		"Back-fill indexes: %d transcript session(s), %d target commit(s), worktree roots=%j",
@@ -294,16 +331,10 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 		worktreeRoots: roots,
 	});
 
-	// 4. Generate + store (unless dry-run).
-	const config = await loadConfig();
-	const llmConfig = {
-		apiKey: config.apiKey,
-		model: config.model,
-		jolliApiKey: config.jolliApiKey,
-		aiProvider: config.aiProvider,
-		localAgentTool: config.localAgentTool,
-		localAgentPath: config.localAgentPath,
-	};
+	// 4. Generate + store (unless dry-run). `config` (the full loaded
+	// JolliMemoryConfig) is passed straight through as the `LlmConfig` — a
+	// structural superset, so no per-field copy to keep in sync. See
+	// `generateAndStore`'s `llmConfig` param doc for why that matters.
 	const credsOk = hasLlmCredentials(config);
 
 	let done = 0;
@@ -341,7 +372,7 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 			outcome = { commitHash: hash, status: "error", message: "no LLM credentials configured" };
 		} else {
 			try {
-				const topics = await generateAndStore(hash, attr, cwd, llmConfig, storage);
+				const topics = await generateAndStore(hash, attr, cwd, config, storage, force);
 				log.info("Back-fill generated %s via %s (%d topics)", hash.substring(0, 8), method, topics);
 				outcome = {
 					commitHash: hash,
@@ -438,7 +469,7 @@ async function pushAuthorFilter(args: string[], cwd: string): Promise<boolean> {
  * the enable-time worker, and the VS Code "missing summaries" count/button.
  *
  * Scoped to the local user's OWN commits (author email OR name): commits authored
- * by others (merged or pulled in) never have Claude transcripts on this machine,
+ * by others (merged or pulled in) never have Claude or Copilot Chat transcripts on this machine,
  * so back-filling them is pointless — they would always resolve to "no
  * conversation found" and inflate the missing-summary count. When no git author
  * identity is configured, the filter is dropped (every commit is a candidate).
@@ -542,7 +573,7 @@ export interface MissingCommitInfo {
  * VS Code cold-start card + Settings panel need the subject + timestamp per commit
  * (to render the selectable row and its relative date), not just the hash. Own-author
  * scoped (email OR name) like every other back-fill entry point — commits authored by
- * others never have local Claude transcripts, so back-filling them is pointless.
+ * others never have local Claude/Copilot Chat transcripts, so back-filling them is pointless.
  *
  *   - `sinceMs` given  → cold-start window (e.g. "last 30 days"): only commits whose
  *                        AUTHOR time is `>= now - sinceMs`. `now` is derived from the

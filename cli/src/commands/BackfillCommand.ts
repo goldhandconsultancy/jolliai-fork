@@ -2,13 +2,15 @@
  * BackfillCommand — `jolli backfill` CLI command.
  *
  * Generates jolli memory summaries for historical commits that lack one, by
- * attributing on-disk Claude transcripts to those commits offline. Fully
- * isolated from the live post-commit pipeline.
+ * attributing on-disk Claude and VS Code Copilot Chat transcripts (unless
+ * `copilotEnabled === false`) to those commits offline. Fully isolated from
+ * the live post-commit pipeline.
  *
  *   jolli backfill                        # last 20 commits, window-collect-all (low)
  *   jolli backfill --last 50              # last 50 commits
  *   jolli backfill --all                  # every commit reachable from HEAD
  *   jolli backfill --hashes h1,h2,h3      # an explicit commit subset (newest-first)
+ *   jolli backfill --hashes h1 --force    # regenerate an already-summarized commit (requires --hashes)
  *   jolli backfill --dry-run              # report attribution + confidence, no LLM call
  *   jolli backfill --min-confidence high  # only file-overlap (high) attributions
  *   jolli backfill --stream               # NDJSON progress events + final report line
@@ -41,6 +43,7 @@ interface BackfillCliOptions {
 	all?: boolean;
 	hashes?: ReadonlyArray<string>;
 	dryRun?: boolean;
+	force?: boolean;
 	minConfidence?: MinConfidence;
 	format?: "json" | "text";
 	stream?: boolean;
@@ -127,12 +130,13 @@ async function emitCandidates(opts: BackfillCliOptions): Promise<void> {
 export function registerBackfillCommand(program: Command): void {
 	program
 		.command("backfill")
-		.description("Generate summaries for historical commits that lack one (Claude transcripts only)")
+		.description("Generate summaries for historical commits that lack one (Claude + Copilot Chat transcripts)")
 		.option("--cwd <dir>", "Project directory (default: git repo root)", resolveProjectDir())
 		.option("--last <n>", "Number of most recent commits to consider", parsePositiveInt, DEFAULT_LAST)
 		.option("--all", "Consider every commit reachable from HEAD")
 		.option("--hashes <list>", "Comma-separated commit hashes to back-fill (overrides --last/--all)", parseHashes)
 		.option("--dry-run", "Report attribution and confidence without calling the LLM")
+		.option("--force", "Regenerate the given --hashes even if already summarized (overwrites; requires --hashes)")
 		.option(
 			"--min-confidence <tier>",
 			"Lowest tier to attribute: high | medium | low",
@@ -149,6 +153,15 @@ export function registerBackfillCommand(program: Command): void {
 
 			if (opts.listCandidates) {
 				await emitCandidates(opts);
+				return;
+			}
+
+			if (opts.force && (!opts.hashes || opts.hashes.length === 0)) {
+				// Guards against accidentally regenerating (LLM cost + overwrite) an
+				// entire --last/--all range — force is only safe for a deliberately
+				// chosen, explicit commit subset.
+				console.error("  --force requires an explicit --hashes list.");
+				process.exitCode = 1;
 				return;
 			}
 
@@ -184,6 +197,7 @@ export function registerBackfillCommand(program: Command): void {
 				// is omitted, so it is always a valid tier here.
 				minTier: opts.minConfidence,
 				onProgress,
+				force: opts.force,
 			});
 
 			if (opts.stream) {

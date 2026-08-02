@@ -212,6 +212,7 @@ describe("PromptTemplates", () => {
 				"plans",
 				"notes",
 				"previousResponse",
+				"languageDirective",
 			]),
 		);
 	});
@@ -231,7 +232,7 @@ describe("PromptTemplates", () => {
 			placeholders.add(match[1]);
 		}
 		expect(placeholders).toEqual(
-			new Set(["squashMessage", "ticketLine", "sourceCommitsBlock", "previousResponse"]),
+			new Set(["squashMessage", "ticketLine", "sourceCommitsBlock", "previousResponse", "languageDirective"]),
 		);
 	});
 
@@ -259,6 +260,7 @@ describe("PromptTemplates", () => {
 				"references",
 				"plans",
 				"notes",
+				"languageDirective",
 			]),
 		);
 	});
@@ -278,7 +280,9 @@ describe("PromptTemplates", () => {
 		for (const match of squash.matchAll(/\{\{\s*(\w+)\s*\}\}/g)) {
 			placeholders.add(match[1]);
 		}
-		expect(placeholders).toEqual(new Set(["squashMessage", "ticketLine", "sourceCommitsBlock"]));
+		expect(placeholders).toEqual(
+			new Set(["squashMessage", "ticketLine", "sourceCommitsBlock", "languageDirective"]),
+		);
 	});
 
 	it("SQUASH_CONSOLIDATE prompt fills cleanly when all placeholders are supplied", () => {
@@ -287,6 +291,7 @@ describe("PromptTemplates", () => {
 			squashMessage: "Add feature X",
 			ticketLine: "PROJ-123",
 			sourceCommitsBlock: "(commits go here)",
+			languageDirective: "",
 		});
 		expect(filled).not.toContain("{{");
 		expect(
@@ -294,6 +299,7 @@ describe("PromptTemplates", () => {
 				squashMessage: "x",
 				ticketLine: "y",
 				sourceCommitsBlock: "z",
+				languageDirective: "",
 			}),
 		).toEqual([]);
 	});
@@ -329,7 +335,7 @@ describe("PromptTemplates", () => {
 			for (const match of recap.matchAll(/\{\{\s*(\w+)\s*\}\}/g)) {
 				placeholders.add(match[1]);
 			}
-			expect(placeholders).toEqual(new Set(["commitMessage", "topicsSummary"]));
+			expect(placeholders).toEqual(new Set(["commitMessage", "topicsSummary", "languageDirective"]));
 		});
 
 		it("wraps inputs in XML tags so transcript content cannot mimic the output spec", () => {
@@ -362,6 +368,7 @@ describe("PromptTemplates", () => {
 			const filled = fillTemplate(recap, {
 				commitMessage: "Add drag handle",
 				topicsSummary: "### Topic 1: Reorder\n- **Trigger:** ...\n- **Decisions:** ...",
+				languageDirective: "",
 			});
 			expect(filled).not.toContain("{{");
 		});
@@ -433,6 +440,7 @@ describe("PromptTemplates", () => {
 					"references",
 					"plans",
 					"notes",
+					"languageDirective",
 				]),
 			);
 		});
@@ -449,6 +457,7 @@ describe("PromptTemplates", () => {
 				references: "",
 				plans: "",
 				notes: "",
+				languageDirective: "",
 			});
 			expect(filled).not.toContain("{{");
 			// The bucket rule lands sandwiched between rule 5 and rule 8 (sanity
@@ -467,14 +476,21 @@ describe("route/reconcile templates", () => {
 	it("registers the route action with topicIndex + sources placeholders", () => {
 		const t = TEMPLATES.get("route");
 		expect(t).toBeDefined();
-		expect(findUnfilledPlaceholders(t?.template ?? "", { topicIndex: "x", sources: "y" })).toEqual([]);
+		expect(
+			findUnfilledPlaceholders(t?.template ?? "", { topicIndex: "x", sources: "y", languageDirective: "" }),
+		).toEqual([]);
 	});
 
 	it("registers the reconcile action with its placeholders", () => {
 		const t = TEMPLATES.get("reconcile");
 		expect(t).toBeDefined();
 		expect(
-			findUnfilledPlaceholders(t?.template ?? "", { topicTitle: "x", currentPage: "y", sources: "z" }),
+			findUnfilledPlaceholders(t?.template ?? "", {
+				topicTitle: "x",
+				currentPage: "y",
+				sources: "z",
+				languageDirective: "",
+			}),
 		).toEqual([]);
 	});
 

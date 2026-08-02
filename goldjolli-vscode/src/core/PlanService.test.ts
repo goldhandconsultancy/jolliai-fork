@@ -1,0 +1,1576 @@
+import { normalize } from "node:path";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+// ─── Hoisted mocks ──────────────────────────────────────────────────────────
+
+const { loadAllSessions, loadPlansRegistry, loadPlansRegistryWithStatus, savePlansRegistry } = vi.hoisted(
+	() => ({
+		loadAllSessions: vi.fn(),
+		loadPlansRegistry: vi.fn(),
+		loadPlansRegistryWithStatus: vi.fn(),
+		savePlansRegistry: vi.fn(),
+	}),
+);
+
+const { storePlans } = vi.hoisted(() => ({
+	storePlans: vi.fn(),
+}));
+
+const { info, warn, error, debug } = vi.hoisted(() => ({
+	info: vi.fn(),
+	warn: vi.fn(),
+	error: vi.fn(),
+	debug: vi.fn(),
+}));
+
+const {
+	mockExistsSync,
+	mockReadFileSync,
+	mockReaddirSync,
+	mockStatSync,
+	mockCreateReadStream,
+	mockUnlinkSync,
+} = vi.hoisted(() => ({
+	mockExistsSync: vi.fn(),
+	mockReadFileSync: vi.fn(),
+	mockReaddirSync: vi.fn(),
+	mockStatSync: vi.fn(),
+	mockCreateReadStream: vi.fn(),
+	mockUnlinkSync: vi.fn(),
+}));
+
+const { mockReadFile } = vi.hoisted(() => ({
+	mockReadFile: vi.fn(),
+}));
+
+const { mockHomedir } = vi.hoisted(() => ({
+	mockHomedir: vi.fn(() => "/mock-home"),
+}));
+
+const { mockCreateInterface } = vi.hoisted(() => ({
+	mockCreateInterface: vi.fn(),
+}));
+
+const { mockCreateHash } = vi.hoisted(() => ({
+	mockCreateHash: vi.fn(() => ({
+		update: () => ({ digest: () => "mock-hash" }),
+	})),
+}));
+
+const { mockExecFileSync } = vi.hoisted(() => ({
+	mockExecFileSync: vi.fn(),
+}));
+
+// ─── vi.mock declarations ────────────────────────────────────────────────────
+
+// plans.lock passthrough — run the RMW body inline (no real lock file I/O on the
+// synthetic CWD). The lock contract is covered in cli/src/core/Locks.test.ts.
+vi.mock("../../../cli/src/core/Locks.js", () => ({
+	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
+}));
+
+vi.mock("../../../cli/src/core/SessionTracker.js", () => ({
+	loadAllSessions,
+	loadPlansRegistry,
+	loadPlansRegistryWithStatus,
+	savePlansRegistry,
+	// Pure helper — provide the real implementation so removePlan's
+	// exact→base-guard resolution works under the mock.
+	splitArchivedKey: (k: string) => {
+		const m = k.match(/^(.+)-([0-9a-f]{8})$/);
+		return m ? { baseKey: m[1], oldShortHash: m[2] } : null;
+	},
+}));
+
+vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
+	storePlans,
+}));
+
+vi.mock("../util/Logger.js", () => ({
+	log: { info, warn, error, debug },
+}));
+
+vi.mock("node:crypto", () => ({
+	createHash: mockCreateHash,
+}));
+
+vi.mock("node:fs", () => ({
+	existsSync: mockExistsSync,
+	readFileSync: mockReadFileSync,
+	createReadStream: mockCreateReadStream,
+	readdirSync: mockReaddirSync,
+	statSync: mockStatSync,
+	unlinkSync: mockUnlinkSync,
+}));
+
+vi.mock("node:fs/promises", () => ({
+	readFile: mockReadFile,
+}));
+
+vi.mock("node:os", () => ({
+	homedir: mockHomedir,
+}));
+
+vi.mock("node:path", async () => {
+	const actual = await vi.importActual<typeof import("node:path")>("node:path");
+	return { ...actual };
+});
+
+vi.mock("node:readline", () => ({
+	createInterface: mockCreateInterface,
+}));
+
+vi.mock("node:child_process", () => ({
+	execFileSync: mockExecFileSync,
+}));
+
+// ─── Import under test (after mocks) ────────────────────────────────────────
+
+import {
+	addPlanToRegistry,
+	archivePlanForCommit,
+	detectPlans,
+	extractTitle,
+	getPlansDir,
+	isPlanFromCurrentProject,
+	listAvailablePlans,
+	listUnassociatedPlans,
+	registerNewPlan,
+	removePlan,
+} from "./PlanService.js";
+
+// ─── Test helpers ────────────────────────────────────────────────────────────
+
+const CWD = "/mock-repo";
+// Normalized so path comparisons match platform-native separators at runtime.
+const PLANS_DIR = normalize("/mock-home/.claude/plans");
+
+function emptyRegistry() {
+	return { version: 1 as const, plans: {} };
+}
+
+function makeEntry(overrides: Record<string, unknown> = {}) {
+	return {
+		slug: "test-plan",
+		title: "Test Plan",
+		sourcePath: `${PLANS_DIR}/test-plan.md`,
+		addedAt: "2025-01-01T00:00:00.000Z",
+		updatedAt: "2025-01-01T00:00:00.000Z",
+		branch: "main",
+		commitHash: null,
+		...overrides,
+	};
+}
+
+/** Sets up sessions.json to return sessions with optional transcript paths. */
+function stubSessions(transcriptPaths: ReadonlyArray<string>) {
+	const sessions: Record<
+		string,
+		{ sessionId: string; transcriptPath: string; updatedAt: string }
+	> = {};
+	for (const [i, tp] of transcriptPaths.entries()) {
+		sessions[`session-${i}`] = {
+			sessionId: `session-${i}`,
+			transcriptPath: tp,
+			updatedAt: "2025-01-01T00:00:00.000Z",
+		};
+	}
+	mockReadFile.mockResolvedValue(JSON.stringify({ version: 1, sessions }));
+}
+
+/** Sets up a mock readline interface that emits lines and closes. */
+function stubTranscript(lines: ReadonlyArray<string>) {
+	mockCreateReadStream.mockReturnValue("mock-stream");
+	mockCreateInterface.mockImplementation(() => {
+		const listeners: Record<
+			string,
+			Array<(...args: Array<unknown>) => void>
+		> = {};
+		const rl = {
+			on(event: string, cb: (...args: Array<unknown>) => void) {
+				if (!listeners[event]) {
+					listeners[event] = [];
+				}
+				listeners[event].push(cb);
+				// When the "close" listener is attached (last one scanTranscript registers),
+				// schedule emission so all listeners are in place.
+				if (event === "error") {
+					queueMicrotask(() => {
+						for (const line of lines) {
+							for (const handler of listeners.line ?? []) {
+								handler(line);
+							}
+						}
+						for (const handler of listeners.close ?? []) {
+							handler();
+						}
+					});
+				}
+				return rl;
+			},
+		};
+		return rl;
+	});
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+describe("PlanService", () => {
+	beforeEach(() => {
+		loadPlansRegistry.mockReset();
+		// Default: delegate to loadPlansRegistry with changed=false. Tests that
+		// exercise the migration-writeback path override with mockResolvedValueOnce.
+		loadPlansRegistryWithStatus.mockImplementation(async (cwd: string) => ({
+			registry: await loadPlansRegistry(cwd),
+			changed: false,
+		}));
+		savePlansRegistry.mockReset();
+		loadAllSessions.mockReset();
+		loadAllSessions.mockResolvedValue([]);
+		storePlans.mockReset();
+		info.mockReset();
+		warn.mockReset();
+		error.mockReset();
+		debug.mockReset();
+		mockExistsSync.mockReset();
+		mockUnlinkSync.mockReset();
+		mockReadFileSync.mockReset();
+		mockReaddirSync.mockReset();
+		// Default: ~/.claude/plans/ is empty so detectPlans()'s directory-diff
+		// auto-registration path short-circuits. Tests that want to simulate
+		// files present override with mockReaddirSync.mockReturnValue([...]).
+		mockReaddirSync.mockReturnValue([]);
+		mockStatSync.mockReset();
+		mockCreateReadStream.mockReset();
+		mockReadFile.mockReset();
+		mockCreateInterface.mockReset();
+		mockCreateHash.mockReset();
+		mockCreateHash.mockImplementation(() => ({
+			update: () => ({ digest: () => "mock-hash" }),
+		}));
+		mockExecFileSync.mockReset();
+		// Default: getCurrentBranch returns "main"
+		mockExecFileSync.mockReturnValue("main\n");
+	});
+
+	// ─── getPlansDir ─────────────────────────────────────────────────────────
+
+	describe("getPlansDir", () => {
+		it("returns path ending in .claude/plans", () => {
+			const dir = getPlansDir();
+			expect(dir).toBe(PLANS_DIR);
+		});
+	});
+
+	// ─── extractTitle ────────────────────────────────────────────────────────
+
+	describe("extractTitle", () => {
+		it("extracts first # heading from file", () => {
+			mockReadFileSync.mockReturnValue("# My Plan Title\n\nSome content");
+			expect(extractTitle("/some/file.md")).toBe("My Plan Title");
+		});
+
+		it("falls back to filename when no heading found", () => {
+			mockReadFileSync.mockReturnValue("No heading here");
+			expect(extractTitle("/some/file.md")).toBe("file.md");
+		});
+
+		it("falls back to Untitled on read error", () => {
+			mockReadFileSync.mockImplementation(() => {
+				throw new Error("ENOENT");
+			});
+			expect(extractTitle("/some/file.md")).toBe("file.md");
+		});
+
+		it("returns empty string when path has no filename component", () => {
+			mockReadFileSync.mockImplementation(() => {
+				throw new Error("ENOENT");
+			});
+			// Edge case: "".split(/[/\\]/).pop() returns "" (not null/undefined), so ?? "Untitled" does not trigger
+			expect(extractTitle("")).toBe("");
+		});
+	});
+
+	// ─── removePlan ────────────────────────────────────────────────────────────
+
+	describe("removePlan", () => {
+		it("removes the registry entry without deleting an external plan file", async () => {
+			// makeEntry's sourcePath is under ~/.claude/plans (external) → file kept.
+			const entry = makeEntry();
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+
+			await removePlan("test-plan", CWD);
+
+			expect(savePlansRegistry).toHaveBeenCalledWith(
+				expect.objectContaining({ plans: {} }),
+				CWD,
+			);
+			expect(mockUnlinkSync).not.toHaveBeenCalled();
+		});
+
+		it("deletes the backing file when the plan source is inside .jolli/jollimemory/", async () => {
+			const internalPath = normalize(
+				`${CWD}/.jolli/jollimemory/notes/inner.md`,
+			);
+			const entry = makeEntry({ sourcePath: internalPath });
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+			mockExistsSync.mockReturnValue(true);
+
+			await removePlan("test-plan", CWD);
+
+			expect(mockUnlinkSync).toHaveBeenCalledWith(internalPath);
+			expect(savePlansRegistry).toHaveBeenCalledWith(
+				expect.objectContaining({ plans: {} }),
+				CWD,
+			);
+		});
+
+		it("does nothing when slug is not in registry", async () => {
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+
+			await removePlan("nonexistent", CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+			expect(mockUnlinkSync).not.toHaveBeenCalled();
+		});
+
+		it("resolves an archived slug to the bare-key guard when it still belongs to that commit", async () => {
+			// CommitSummary passes `<base>-<8hex>` + expectedCommitHash; the guard
+			// lives at the base key and its commitHash matches → delete the base.
+			const guard = makeEntry({ slug: "my-plan", commitHash: "abcdef1234567890", contentHashAtCommit: "h" });
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { "my-plan": guard } });
+
+			await removePlan("my-plan-abcdef12", CWD, "abcdef1234567890");
+
+			expect(savePlansRegistry).toHaveBeenCalledWith(expect.objectContaining({ plans: {} }), CWD);
+		});
+
+		it("does NOT delete the base row when it was revived/re-committed since (commitHash mismatch)", async () => {
+			// P1 regression: dissociating an OLD commit must not wipe a base row that
+			// is now a live active plan (commitHash=null) or re-committed elsewhere.
+			const revived = makeEntry({ slug: "my-plan", commitHash: null });
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { "my-plan": revived } });
+
+			await removePlan("my-plan-abcdef12", CWD, "abcdef1234567890");
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+			expect(mockUnlinkSync).not.toHaveBeenCalled();
+		});
+
+		it("deletes the exact key (not the stripped base) when it is this commit's guard", async () => {
+			// `foo-deadbeef` is this commit's guard; the exact key must win — never strip to `foo`.
+			const foo = makeEntry({ slug: "foo", commitHash: "abcdef1234567890" });
+			const realEntry = makeEntry({ slug: "foo-deadbeef", commitHash: "abcdef1234567890" });
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { foo, "foo-deadbeef": realEntry } });
+
+			await removePlan("foo-deadbeef", CWD, "abcdef1234567890");
+
+			const saved = savePlansRegistry.mock.calls.at(-1)?.[0] as { plans: Record<string, unknown> };
+			expect(saved.plans["foo-deadbeef"]).toBeUndefined();
+			expect(saved.plans.foo).toBeDefined(); // base NOT mis-stripped
+		});
+
+		it("does NOT delete a live exact-key row (commitHash mismatch) when dissociating an old commit", async () => {
+			// P1-extended: an archived slug `foo-deadbeef` from an old summary can later
+			// become a LIVE plan created under that exact key (commitHash=null). The exact
+			// key matches, but the commitHash does not — dissociating the old commit must
+			// not wipe the live row. The sidebar (no expectedCommitHash) still deletes it.
+			const live = makeEntry({ slug: "foo-deadbeef", commitHash: null });
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { "foo-deadbeef": live } });
+
+			await removePlan("foo-deadbeef", CWD, "abcdef1234567890");
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+			expect(mockUnlinkSync).not.toHaveBeenCalled();
+		});
+
+		it("deletes the exact key unconditionally on the sidebar path (no expectedCommitHash)", async () => {
+			// A committed plan removed via the sidebar — no expectedCommitHash — is deleted
+			// regardless of its commitHash. The user explicitly asked to remove the live plan.
+			const committed = makeEntry({ slug: "test-plan", commitHash: "abcdef1234567890" });
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { "test-plan": committed } });
+
+			await removePlan("test-plan", CWD);
+
+			expect(savePlansRegistry).toHaveBeenCalledWith(expect.objectContaining({ plans: {} }), CWD);
+		});
+
+		it("is a no-op when the resolved key maps to a null entry (L231 defensive guard)", async () => {
+			// `plans[slug]` is present but null: key resolves (null !== undefined) yet
+			// `entry` is falsy, so the L231 guard returns null before any delete/save.
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "my-plan": null },
+			});
+
+			await removePlan("my-plan", CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+			expect(mockUnlinkSync).not.toHaveBeenCalled();
+		});
+
+		it("still removes the entry when internal file deletion throws", async () => {
+			const internalPath = normalize(
+				`${CWD}/.jolli/jollimemory/notes/inner.md`,
+			);
+			const entry = makeEntry({ sourcePath: internalPath });
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+			mockExistsSync.mockReturnValue(true);
+			mockUnlinkSync.mockImplementationOnce(() => {
+				throw new Error("EACCES");
+			});
+
+			await removePlan("test-plan", CWD);
+
+			expect(savePlansRegistry).toHaveBeenCalledWith(
+				expect.objectContaining({ plans: {} }),
+				CWD,
+			);
+		});
+	});
+
+	// ─── addPlanToRegistry ───────────────────────────────────────────────────
+
+	describe("addPlanToRegistry", () => {
+		it("creates new entry for plan file that exists", async () => {
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Fresh Plan\nContent");
+
+			await addPlanToRegistry("fresh-plan", CWD);
+
+			expect(savePlansRegistry).toHaveBeenCalledWith(
+				expect.objectContaining({
+					plans: expect.objectContaining({
+						"fresh-plan": expect.objectContaining({
+							slug: "fresh-plan",
+							title: "Fresh Plan",
+							commitHash: null,
+						}),
+					}),
+				}),
+				CWD,
+			);
+		});
+
+		it("clears ignored flag on existing entry", async () => {
+			const entry = makeEntry({ ignored: true });
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+			mockExistsSync.mockReturnValue(true);
+
+			await addPlanToRegistry("test-plan", CWD);
+
+			const saved = savePlansRegistry.mock.calls[0][0];
+			expect(saved.plans["test-plan"].ignored).toBeUndefined();
+		});
+
+		it("does nothing when plan file does not exist", async () => {
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+			mockExistsSync.mockReturnValue(false);
+
+			await addPlanToRegistry("missing-plan", CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+		});
+
+		it("omits the branch field when the git branch lookup is unknown (L279 ternary else)", async () => {
+			// getCurrentBranchSafe returns "unknown" when git fails → the branchField
+			// ternary takes its empty-object alternate and no `branch` is stamped.
+			mockExecFileSync.mockImplementation(() => {
+				throw new Error("not a git repo");
+			});
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Fresh Plan");
+
+			await addPlanToRegistry("fresh-plan", CWD);
+
+			const saved = savePlansRegistry.mock.calls[0][0];
+			expect(saved.plans["fresh-plan"].branch).toBeUndefined();
+		});
+
+		it("resets existing commitHash when re-adding an ignored plan", async () => {
+			const entry = makeEntry({ ignored: true, commitHash: "abc123" });
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+			mockExistsSync.mockReturnValue(true);
+
+			await addPlanToRegistry("test-plan", CWD);
+
+			const saved = savePlansRegistry.mock.calls[0][0];
+			expect(saved.plans["test-plan"].commitHash).toBeNull();
+		});
+	});
+
+	// ─── listAvailablePlans ──────────────────────────────────────────────────
+
+	describe("listAvailablePlans", () => {
+		it("returns plans not in exclude set, with mtimes for sorting", () => {
+			mockExistsSync.mockReturnValue(true);
+			mockReaddirSync.mockReturnValue(["beta.md", "alpha.md", "gamma.md"]);
+			mockReadFileSync.mockImplementation((path: string) => {
+				if (path.includes("alpha")) {
+					return "# Alpha Plan";
+				}
+				if (path.includes("beta")) {
+					return "# Beta Plan";
+				}
+				return "# Gamma Plan";
+			});
+
+			const result = listAvailablePlans(new Set(["beta"]));
+
+			expect(result).toEqual([
+				{ slug: "alpha", title: "Alpha Plan", mtimeMs: 0 },
+				{ slug: "gamma", title: "Gamma Plan", mtimeMs: 0 },
+			]);
+		});
+
+		it("returns empty when PLANS_DIR does not exist", () => {
+			mockExistsSync.mockReturnValue(false);
+
+			const result = listAvailablePlans(new Set());
+
+			expect(result).toEqual([]);
+		});
+
+		it("filters non-markdown files", () => {
+			mockExistsSync.mockReturnValue(true);
+			mockReaddirSync.mockReturnValue(["plan.md", "readme.txt", "notes.md"]);
+			mockReadFileSync.mockReturnValue("# Title");
+
+			const result = listAvailablePlans(new Set());
+
+			expect(result).toHaveLength(2);
+			expect(result.map((p) => p.slug)).toEqual(
+				expect.arrayContaining(["plan", "notes"]),
+			);
+		});
+	});
+
+	// ─── archivePlanForCommit ────────────────────────────────────────────────
+
+	describe("archivePlanForCommit", () => {
+		it("sets the archive guard on the original and returns a PlanReference with the new slug", async () => {
+			const entry = makeEntry({});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Test Plan\nContent");
+
+			const result = await archivePlanForCommit(
+				"test-plan",
+				"06d0f729abcdef12",
+				CWD,
+			);
+
+			expect(result).toEqual(
+				expect.objectContaining({
+					slug: "test-plan-06d0f729",
+					title: "Test Plan",
+				}),
+			);
+
+			const saved = savePlansRegistry.mock.calls[0][0];
+			// Only the guard row (original slug) survives — it carries the
+			// archive-time contentHashAtCommit and the commit hash.
+			expect(saved.plans["test-plan"].contentHashAtCommit).toBe("mock-hash");
+			expect(saved.plans["test-plan"].commitHash).toBe("06d0f729abcdef12");
+			// No per-commit archive row is created; the new slug lives only in the
+			// returned PlanReference / orphan-branch snapshot.
+			expect(saved.plans["test-plan-06d0f729"]).toBeUndefined();
+		});
+
+		it("stores plan file in orphan branch", async () => {
+			const entry = makeEntry();
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Test Plan\nContent");
+
+			await archivePlanForCommit("test-plan", "06d0f729abcdef12", CWD);
+
+			expect(storePlans).toHaveBeenCalledWith(
+				[{ slug: "test-plan-06d0f729", content: "# Test Plan\nContent" }],
+				expect.stringContaining("Associate plan"),
+				CWD,
+				undefined,
+				undefined,
+			);
+		});
+
+		it("creates entry when slug is not in registry", async () => {
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# New Plan\nContent");
+
+			const result = await archivePlanForCommit(
+				"new-plan",
+				"aaaa1111bbbb2222",
+				CWD,
+			);
+
+			expect(result).not.toBeNull();
+			expect(result?.slug).toBe("new-plan-aaaa1111");
+		});
+
+		it("omits the branch field on a freshly-created entry when git branch is unknown (L431 ternary else)", async () => {
+			// slug not in registry → a fresh entry is built; getCurrentBranchSafe
+			// returning "unknown" (git failure) takes the ternary's empty-object arm.
+			mockExecFileSync.mockImplementation(() => {
+				throw new Error("no git");
+			});
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# New Plan\nContent");
+
+			const result = await archivePlanForCommit(
+				"new-plan",
+				"aaaa1111bbbb2222",
+				CWD,
+			);
+
+			expect(result).not.toBeNull();
+			expect(result?.slug).toBe("new-plan-aaaa1111");
+		});
+
+		it("returns null when plan file does not exist and slug not in registry", async () => {
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+			mockExistsSync.mockReturnValue(false);
+
+			const result = await archivePlanForCommit("missing", "abc12345", CWD);
+
+			expect(result).toBeNull();
+		});
+
+		it("skips contentHashAtCommit when source file does not exist during archive", async () => {
+			const entry = makeEntry({});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+			mockReadFileSync.mockReturnValue("# Test Plan\nContent");
+			// sourcePath does not exist (line 262 false branch), but planFile does exist (line 296)
+			mockExistsSync.mockImplementation((path: string) => {
+				if (path === entry.sourcePath) {
+					return false;
+				}
+				return true;
+			});
+
+			const result = await archivePlanForCommit(
+				"test-plan",
+				"06d0f729abcdef12",
+				CWD,
+			);
+
+			expect(result).not.toBeNull();
+			const saved = savePlansRegistry.mock.calls[0][0];
+			// contentHashAtCommit should be undefined since source file doesn't exist
+			expect(saved.plans["test-plan"].contentHashAtCommit).toBeUndefined();
+		});
+
+		it("skips storePlans when sourcePath does not exist on disk", async () => {
+			// sourcePath gone → both the contentHash branch and the orphan-store branch
+			// skip, but the registry update still happens (so the caller can record
+			// the association even if the file vanished between detection and archive).
+			const entry = makeEntry({
+				sourcePath: "/other/path/test-plan.md",
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+			mockReadFileSync.mockReturnValue("# Test Plan\nContent");
+			mockExistsSync.mockReturnValue(false);
+
+			const result = await archivePlanForCommit(
+				"test-plan",
+				"06d0f729abcdef12",
+				CWD,
+			);
+
+			expect(result).not.toBeNull();
+			expect(storePlans).not.toHaveBeenCalled();
+		});
+
+		it("reads content from entry.sourcePath for external plan paths", async () => {
+			// Regression guard: archivePlanForCommit must read the actual sourcePath,
+			// not a synthetic ~/.claude/plans/<slug>.md path, so external plans like
+			// docs/foo.md are archived correctly.
+			const externalPath = "/repo/docs/foo-plan.md";
+			const entry = makeEntry({
+				slug: "foo-plan",
+				sourcePath: externalPath,
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "foo-plan": entry },
+			});
+			mockReadFileSync.mockImplementation((path: unknown) =>
+				path === externalPath ? "# External\nbody" : "",
+			);
+			mockExistsSync.mockImplementation(
+				(path: unknown) => path === externalPath,
+			);
+
+			await archivePlanForCommit("foo-plan", "deadbeefcafebabe", CWD);
+
+			expect(storePlans).toHaveBeenCalledWith(
+				[
+					expect.objectContaining({
+						slug: "foo-plan-deadbeef",
+						content: "# External\nbody",
+					}),
+				],
+				expect.any(String),
+				CWD,
+				// branch / storage are intentionally undefined — see archivePlanForCommit
+				// comment about FolderStorage resolving the branch from the commit hash
+				// embedded in the slug.
+				undefined,
+				undefined,
+			);
+		});
+	});
+
+	// ─── listUnassociatedPlans ───────────────────────────────────────────────
+
+	describe("listUnassociatedPlans", () => {
+		it("returns plans where commitHash is null", async () => {
+			const plans = {
+				"plan-a": makeEntry({
+					slug: "plan-a",
+					title: "Plan A",
+					commitHash: null,
+				}),
+				"plan-b": makeEntry({
+					slug: "plan-b",
+					title: "Plan B",
+					commitHash: "abc123",
+				}),
+				"plan-c": makeEntry({
+					slug: "plan-c",
+					title: "Plan C",
+					commitHash: null,
+				}),
+			};
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans });
+
+			const result = await listUnassociatedPlans(CWD);
+
+			expect(result).toEqual([
+				{ slug: "plan-a", title: "Plan A" },
+				{ slug: "plan-c", title: "Plan C" },
+			]);
+		});
+
+		it("returns empty array when all plans are committed", async () => {
+			const plans = {
+				"plan-a": makeEntry({ slug: "plan-a", commitHash: "abc123" }),
+			};
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans });
+
+			const result = await listUnassociatedPlans(CWD);
+
+			expect(result).toEqual([]);
+		});
+	});
+
+	// ─── detectPlans ─────────────────────────────────────────────────────────
+
+	describe("detectPlans", () => {
+		it("persists the normalised registry when migration purged legacy rows/fields (changed=true)", async () => {
+			const entry = makeEntry();
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { "test-plan": entry } });
+			// Simulate loadPlansRegistry having stripped a legacy field/row: changed=true
+			// even though there are no orphaned entries to clean. Two primed responses:
+			// the read-side load, then the fresh re-read done inside plans.lock before
+			// the writeback (nothing persisted yet, so both report changed=true).
+			loadPlansRegistryWithStatus
+				.mockResolvedValueOnce({
+					registry: { version: 1, plans: { "test-plan": entry } },
+					changed: true,
+				})
+				.mockResolvedValueOnce({
+					registry: { version: 1, plans: { "test-plan": entry } },
+					changed: true,
+				});
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Test Plan");
+			mockStatSync.mockReturnValue({ mtime: new Date("2025-06-01T00:00:00.000Z") });
+
+			await detectPlans(CWD);
+
+			// Deterministic writeback: the cleaned registry is flushed once.
+			expect(savePlansRegistry).toHaveBeenCalledTimes(1);
+		});
+
+		it("skips the in-lock writeback when the fresh re-read is already clean (L97 else)", async () => {
+			// Outer status reports changed=true (enters the lock block), but the
+			// in-lock fresh re-read reports changed=false with no orphans → `mutate`
+			// stays false and the redundant save is skipped (idempotency guard).
+			const entry = makeEntry();
+			loadPlansRegistryWithStatus
+				.mockResolvedValueOnce({
+					registry: { version: 1, plans: { "test-plan": entry } },
+					changed: true,
+				})
+				.mockResolvedValueOnce({
+					registry: { version: 1, plans: { "test-plan": entry } },
+					changed: false,
+				});
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Test Plan");
+			mockStatSync.mockReturnValue({ mtime: new Date("2025-06-01T00:00:00.000Z") });
+
+			await detectPlans(CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+		});
+
+		it("filters an uncommitted plan whose file vanishes between cleanup and render (L145 TOCTOU)", async () => {
+			// The cleanup pass sees the file present (survives), but toPlanInfo's
+			// re-check finds it gone → the L145 `commitHash===null && !existsSync`
+			// guard returns null so the row is dropped from the panel.
+			const entry = makeEntry({
+				slug: "toctou",
+				commitHash: null,
+				sourcePath: `${PLANS_DIR}/toctou.md`,
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { toctou: entry },
+			});
+			let n = 0;
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p === entry.sourcePath) {
+					n++;
+					return n === 1; // present during cleanup, gone at render
+				}
+				return false;
+			});
+			mockReadFileSync.mockReturnValue("# Toctou");
+
+			const plans = await detectPlans(CWD);
+
+			expect(plans.find((p) => p.slug === "toctou")).toBeUndefined();
+		});
+
+		it("committed guard with changed content skips title/mtime refresh when file vanishes mid-render (L156/L161 else)", async () => {
+			// A committed-then-modified guard row is shown (hash differs). If the
+			// source file disappears after the guard hash check, the title and
+			// lastModified refreshes are skipped and fall back to the registry values.
+			const entry = makeEntry({
+				slug: "toctou2",
+				commitHash: "abc12345",
+				contentHashAtCommit: "stale-hash", // differs from mockCreateHash "mock-hash" → shown
+				sourcePath: `${PLANS_DIR}/toctou2.md`,
+				title: "Frozen Title",
+				updatedAt: "2025-02-02T00:00:00.000Z",
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { toctou2: entry },
+			});
+			let n = 0;
+			mockExistsSync.mockImplementation((p: string) => {
+				if (p === entry.sourcePath) {
+					n++;
+					return n === 1; // present for the guard hash check, gone afterwards
+				}
+				return false;
+			});
+			mockReadFileSync.mockReturnValue("# Changed Content");
+
+			const plans = await detectPlans(CWD);
+
+			expect(plans).toHaveLength(1);
+			expect(plans[0].slug).toBe("toctou2");
+			// File gone at render → title / lastModified fall back to registry values.
+			expect(plans[0].title).toBe("Frozen Title");
+			expect(plans[0].lastModified).toBe("2025-02-02T00:00:00.000Z");
+		});
+
+		it("does not persist when nothing changed and no orphans (changed=false)", async () => {
+			const entry = makeEntry();
+			loadPlansRegistry.mockResolvedValue({ version: 1, plans: { "test-plan": entry } });
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Test Plan");
+			mockStatSync.mockReturnValue({ mtime: new Date("2025-06-01T00:00:00.000Z") });
+
+			await detectPlans(CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+		});
+
+		it("returns plans from registry merged with transcript discoveries", async () => {
+			const entry = makeEntry();
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+			// Sessions file has one session pointing to a transcript
+			stubSessions(["/mock-transcript.jsonl"]);
+			// Transcript lines: slug discovery + 1 edit
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Test Plan\nContent");
+			mockStatSync.mockReturnValue({
+				mtime: new Date("2025-06-01T00:00:00.000Z"),
+			});
+
+			stubTranscript([
+				'{"type":"message","slug":"test-plan"}',
+				'{"type":"tool_use","name":"Write","file":"test-plan.md"}',
+			]);
+
+			const plans = await detectPlans(CWD);
+
+			expect(plans.length).toBeGreaterThanOrEqual(1);
+			expect(plans[0].slug).toBe("test-plan");
+		});
+
+		it("filters out archive guards with unchanged hash", async () => {
+			const entry = makeEntry({ contentHashAtCommit: "mock-hash" });
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+			stubSessions([]);
+			mockReadFile.mockResolvedValue(
+				JSON.stringify({ version: 1, sessions: {} }),
+			);
+			// existsSync returns true, hashFileContent returns "mock-hash" (matches contentHashAtCommit)
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("content");
+
+			const plans = await detectPlans(CWD);
+
+			expect(plans.find((p) => p.slug === "test-plan")).toBeUndefined();
+		});
+
+		it("filters out committed plans that are not on the current branch", async () => {
+			const entry = makeEntry({ commitHash: "deadbeef12345678" });
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Test Plan\nContent");
+			mockStatSync.mockReturnValue({
+				mtime: new Date("2025-06-01T00:00:00.000Z"),
+			});
+			// isCommitOnCurrentBranch throws → commit not on branch
+			mockExecFileSync.mockImplementation(
+				(_cmd: string, args: Array<string>) => {
+					if (args[0] === "rev-parse") {
+						return "main\n";
+					}
+					// merge-base --is-ancestor throws for cross-branch
+					throw new Error("not ancestor");
+				},
+			);
+
+			const plans = await detectPlans(CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+			expect(plans.find((p) => p.slug === "test-plan")).toBeUndefined();
+		});
+
+		it("removes orphaned entries with no source file", async () => {
+			const entry = makeEntry({
+				sourcePath: "/mock-home/.claude/plans/orphan.md",
+			});
+			loadPlansRegistry
+				.mockResolvedValueOnce({ version: 1, plans: { orphan: entry } })
+				.mockResolvedValueOnce({ version: 1, plans: { orphan: entry } });
+			stubSessions([]);
+			mockReadFile.mockResolvedValue(
+				JSON.stringify({ version: 1, sessions: {} }),
+			);
+			// existsSync returns false → orphan file is gone
+			mockExistsSync.mockReturnValue(false);
+
+			const plans = await detectPlans(CWD);
+
+			const saved = savePlansRegistry.mock.calls[0][0];
+			expect(saved.plans.orphan).toBeUndefined();
+			expect(plans).toEqual([]);
+		});
+
+		it("does not mutate commit hashes during read-only detection", async () => {
+			const entry = makeEntry({ slug: "test-plan", commitHash: null });
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Test Plan\nContent");
+			mockStatSync.mockReturnValue({
+				mtime: new Date("2025-06-01T00:00:00.000Z"),
+			});
+
+			const plans = await detectPlans(CWD);
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+			expect(plans[0].commitHash).toBeNull();
+		});
+
+		it("returns sorted by lastModified descending", async () => {
+			const entryA = makeEntry({
+				slug: "plan-a",
+				title: "Plan A",
+				sourcePath: `${PLANS_DIR}/plan-a.md`,
+				updatedAt: "2025-01-01T00:00:00.000Z",
+			});
+			const entryB = makeEntry({
+				slug: "plan-b",
+				title: "Plan B",
+				sourcePath: `${PLANS_DIR}/plan-b.md`,
+				updatedAt: "2025-06-01T00:00:00.000Z",
+			});
+			loadPlansRegistry
+				.mockResolvedValueOnce({
+					version: 1,
+					plans: { "plan-a": entryA, "plan-b": entryB },
+				})
+				.mockResolvedValueOnce({
+					version: 1,
+					plans: { "plan-a": entryA, "plan-b": entryB },
+				});
+
+			stubSessions([]);
+			mockReadFile.mockResolvedValue(
+				JSON.stringify({ version: 1, sessions: {} }),
+			);
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Title");
+			mockStatSync.mockImplementation((path: string) => {
+				if (path.includes("plan-a")) {
+					return { mtime: new Date("2025-01-01T00:00:00.000Z") };
+				}
+				return { mtime: new Date("2025-06-01T00:00:00.000Z") };
+			});
+
+			const plans = await detectPlans(CWD);
+
+			expect(plans[0].slug).toBe("plan-b");
+			expect(plans[1].slug).toBe("plan-a");
+		});
+
+		it("handles an empty registry gracefully", async () => {
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+
+			const plans = await detectPlans(CWD);
+
+			expect(plans).toEqual([]);
+		});
+
+		it("does not create new plans from transcripts during detection", async () => {
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+
+			const plans = await detectPlans(CWD);
+
+			expect(plans).toEqual([]);
+		});
+
+		it("revives archived guard when source file has changed", async () => {
+			const guardEntry = makeEntry({
+				slug: "archived-plan",
+				contentHashAtCommit: "old-hash",
+				sourcePath: `${PLANS_DIR}/archived-plan.md`,
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "archived-plan": guardEntry },
+			});
+
+			mockExistsSync.mockReturnValue(true);
+			// hashFileContent will use createHash which returns "mock-hash", different from "old-hash"
+			mockReadFileSync.mockReturnValue("# Updated Archived Plan");
+			mockStatSync.mockReturnValue({
+				mtime: new Date("2025-06-15T00:00:00.000Z"),
+			});
+
+			const plans = await detectPlans(CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+			expect(plans.find((p) => p.slug === "archived-plan")).toBeDefined();
+		});
+
+		it("skips discovered plan when plan file does not exist but transcript does", async () => {
+			loadPlansRegistry
+				.mockResolvedValueOnce(emptyRegistry())
+				.mockResolvedValueOnce(emptyRegistry());
+
+			stubSessions(["/mock-transcript.jsonl"]);
+			stubTranscript(['{"type":"message","slug":"no-file-plan"}']);
+
+			// existsSync returns true for transcript path but false for the plan file
+			mockExistsSync.mockImplementation((path: string) => {
+				if (path.includes("mock-transcript")) {
+					return true;
+				}
+				return false;
+			});
+
+			const plans = await detectPlans(CWD);
+
+			// The plan file doesn't exist, so mergeDiscoveredPlans skips it (line 101)
+			expect(plans).toEqual([]);
+		});
+
+		it("continues hiding archived guard when file hash matches contentHashAtCommit", async () => {
+			const guardEntry = makeEntry({
+				slug: "guarded-plan",
+				contentHashAtCommit: "mock-hash", // matches what mockCreateHash returns
+				sourcePath: `${PLANS_DIR}/guarded-plan.md`,
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "guarded-plan": guardEntry },
+			});
+
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Guarded Plan");
+
+			const plans = await detectPlans(CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+			// toPlanInfo filters it out since it's still an unchanged archive guard
+			expect(plans.find((p) => p.slug === "guarded-plan")).toBeUndefined();
+		});
+
+		it("toPlanInfo guard reads from entry.sourcePath for external plan paths", async () => {
+			// Regression guard: the archive-guard check must hash entry.sourcePath
+			// (the actual on-disk file, possibly outside ~/.claude/plans/) rather than
+			// a synthetic PLANS_DIR/<slug>.md path.
+			const externalPath = "/repo/docs/foo-plan.md";
+			const guardEntry = makeEntry({
+				slug: "foo-plan",
+				commitHash: "abc12345",
+				contentHashAtCommit: "mock-hash", // matches what mockCreateHash returns
+				sourcePath: externalPath,
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "foo-plan": guardEntry },
+			});
+
+			mockExistsSync.mockImplementation(
+				(path: unknown) => path === externalPath,
+			);
+			mockReadFileSync.mockImplementation((path: unknown) =>
+				path === externalPath ? "# Foo" : "",
+			);
+
+			const plans = await detectPlans(CWD);
+
+			// Hash matches → guard still active → not shown in panel
+			expect(plans.find((p) => p.slug === "foo-plan")).toBeUndefined();
+		});
+
+		it("shows committed plan with changed content (archive guard with modified file)", async () => {
+			const guardEntry = makeEntry({
+				slug: "modified-plan",
+				commitHash: "abc12345",
+				contentHashAtCommit: "stale-hash", // differs from mockCreateHash's "mock-hash"
+				sourcePath: `${PLANS_DIR}/modified-plan.md`,
+				updatedAt: "2025-06-01T00:00:00.000Z",
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "modified-plan": guardEntry },
+			});
+
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Modified Plan");
+			mockStatSync.mockReturnValue({
+				mtime: new Date("2025-07-01T00:00:00.000Z"),
+			});
+
+			const plans = await detectPlans(CWD);
+
+			expect(plans).toHaveLength(1);
+			expect(plans[0].slug).toBe("modified-plan");
+			// Committed-then-modified guard: filePath keeps the on-disk path and
+			// title and lastModified reflect the file, so Edit / Preview open the
+			// same local content shown in the row — same contract as NoteService guards.
+			expect(plans[0].title).toBe("Modified Plan");
+			expect(plans[0].filePath).toBe(`${PLANS_DIR}/modified-plan.md`);
+			expect(plans[0].lastModified).toBe("2025-07-01T00:00:00.000Z");
+		});
+
+		it("filters out uncommitted plans whose source file has been deleted", async () => {
+			// Uncommitted plan (commitHash === null) + sourcePath missing on
+			// disk = the user deleted the file outside the registry. Without
+			// this filter the sidebar would show a row that 404s on click.
+			const entry = makeEntry({
+				slug: "deleted-plan",
+				commitHash: null,
+				sourcePath: `${PLANS_DIR}/deleted-plan.md`,
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "deleted-plan": entry },
+			});
+			stubSessions([]);
+			mockReadFile.mockResolvedValue(
+				JSON.stringify({ version: 1, sessions: {} }),
+			);
+			// The plan file does NOT exist anywhere.
+			mockExistsSync.mockReturnValue(false);
+
+			const plans = await detectPlans(CWD);
+			expect(plans.find((p) => p.slug === "deleted-plan")).toBeUndefined();
+		});
+
+		it("uses updatedAt as fallback when statSync throws in toPlanInfo", async () => {
+			const entry = makeEntry({
+				slug: "stat-fail",
+				sourcePath: `${PLANS_DIR}/stat-fail.md`,
+				updatedAt: "2025-04-01T00:00:00.000Z",
+			});
+			loadPlansRegistry
+				.mockResolvedValueOnce({ version: 1, plans: { "stat-fail": entry } })
+				.mockResolvedValueOnce({ version: 1, plans: { "stat-fail": entry } });
+
+			stubSessions([]);
+			mockReadFile.mockResolvedValue(
+				JSON.stringify({ version: 1, sessions: {} }),
+			);
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Stat Fail Plan");
+			// statSync throws → catch ignores (line 234)
+			mockStatSync.mockImplementation(() => {
+				throw new Error("ENOENT");
+			});
+
+			const plans = await detectPlans(CWD);
+
+			expect(plans).toHaveLength(1);
+			expect(plans[0].slug).toBe("stat-fail");
+			// lastModified falls back to entry.updatedAt since statSync failed
+			expect(plans[0].lastModified).toBe("2025-04-01T00:00:00.000Z");
+		});
+
+		it("skips transcript discovery when plan file does not exist", async () => {
+			loadPlansRegistry
+				.mockResolvedValueOnce(emptyRegistry())
+				.mockResolvedValueOnce(emptyRegistry());
+
+			stubSessions(["/mock-transcript.jsonl"]);
+			stubTranscript(['{"type":"message","slug":"ghost-plan"}']);
+
+			mockExistsSync.mockReturnValue(false);
+
+			const plans = await detectPlans(CWD);
+
+			expect(plans).toEqual([]);
+		});
+
+		it("skips uncommitted plan with archive guard when source file was deleted", async () => {
+			const entry = makeEntry({
+				slug: "guarded-deleted",
+				commitHash: null,
+				contentHashAtCommit: "old-hash", // survives cleaning phase
+				sourcePath: `${PLANS_DIR}/guarded-deleted-source.md`,
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "guarded-deleted": entry },
+			});
+
+			// Plan file in PLANS_DIR exists with different hash (passes archive guard)
+			// but sourcePath does not exist (hits line 100-101)
+			mockExistsSync.mockImplementation((path: string) => {
+				if (path.includes("guarded-deleted.md")) {
+					return true; // plan file exists for archive guard check
+				}
+				return false; // sourcePath does not exist
+			});
+			mockReadFileSync.mockReturnValue("# Different Content");
+
+			const plans = await detectPlans(CWD);
+
+			// Plan should be filtered out because source file is deleted
+			expect(plans.find((p) => p.slug === "guarded-deleted")).toBeUndefined();
+		});
+
+		it("uses extractTitle for uncommitted plans whose source file exists", async () => {
+			const entry = makeEntry({
+				slug: "live-plan",
+				title: "Old Title",
+				commitHash: null,
+				sourcePath: `${PLANS_DIR}/live-plan.md`,
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "live-plan": entry },
+			});
+
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Fresh Title From File\nContent");
+			mockStatSync.mockReturnValue({
+				mtime: new Date("2025-06-01T00:00:00.000Z"),
+			});
+
+			const plans = await detectPlans(CWD);
+
+			expect(plans).toHaveLength(1);
+			expect(plans[0].title).toBe("Fresh Title From File");
+		});
+
+		it("does not mutate existing uncommitted entries during detection", async () => {
+			const entry = makeEntry({});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Test Plan");
+			mockStatSync.mockReturnValue({
+				mtime: new Date("2025-06-01T00:00:00.000Z"),
+			});
+
+			const plans = await detectPlans(CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+			expect(plans).toHaveLength(1);
+		});
+
+		it("returns current registry plans without transcript scanning", async () => {
+			const entry = makeEntry({
+				slug: "current-plan",
+				sourcePath: `${PLANS_DIR}/current-plan.md`,
+			});
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "current-plan": entry },
+			});
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Current Plan");
+			mockStatSync.mockReturnValue({
+				mtime: new Date("2025-06-01T00:00:00.000Z"),
+			});
+
+			const plans = await detectPlans(CWD);
+
+			expect(plans).toHaveLength(1);
+			expect(plans[0].slug).toBe("current-plan");
+		});
+
+		it("does not mutate committed entries during detection", async () => {
+			const entry = makeEntry({ commitHash: "abc123" });
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "test-plan": entry },
+			});
+
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# Test Plan");
+			// isCommitOnCurrentBranch succeeds (no throw)
+			mockExecFileSync.mockImplementation(
+				(_cmd: string, args: Array<string>) => {
+					if (args[0] === "rev-parse") {
+						return "main\n";
+					}
+					return ""; // merge-base --is-ancestor succeeds
+				},
+			);
+
+			await detectPlans(CWD);
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+			expect(loadPlansRegistry).toHaveBeenCalledWith(CWD);
+		});
+
+		// detectPlans() no longer auto-discovers files — registration is the
+		// job of the plans-dir watcher's onDidCreate in Extension.ts.
+		// Historical directory contents must stay out of the panel; that contract is
+		// exercised by registerNewPlan tests below + Extension.ts watcher tests.
+
+		it("does not scan ~/.claude/plans/ directory to auto-register files", async () => {
+			// A lone historical file exists on disk but is not in the registry.
+			// detectPlans must NOT pick it up (that would leak cross-project history).
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+			mockExistsSync.mockReturnValue(true);
+			mockReaddirSync.mockReturnValue(["historical-plan.md"]);
+			mockReadFileSync.mockReturnValue("# Historical");
+			mockStatSync.mockReturnValue({
+				mtime: new Date("2025-01-01T00:00:00.000Z"),
+				mtimeMs: 1,
+			});
+
+			const plans = await detectPlans(CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+			expect(plans).toEqual([]);
+		});
+	});
+
+	// ─── registerNewPlan (Step 1) ─────────────────────────────────
+
+	describe("registerNewPlan", () => {
+		it("calls addPlanToRegistry for a slug not yet in registry", async () => {
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+			mockExistsSync.mockReturnValue(true);
+			mockReadFileSync.mockReturnValue("# New Plan");
+
+			await registerNewPlan("new-plan", CWD);
+
+			expect(savePlansRegistry).toHaveBeenCalled();
+			const saved = savePlansRegistry.mock.calls[0][0];
+			expect(saved.plans["new-plan"]).toEqual(
+				expect.objectContaining({
+					slug: "new-plan",
+					title: "New Plan",
+					commitHash: null,
+				}),
+			);
+		});
+
+		it("is a no-op when the slug is already tracked in the registry", async () => {
+			const existing = makeEntry({ slug: "existing-plan" });
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "existing-plan": existing },
+			});
+
+			await registerNewPlan("existing-plan", CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+		});
+
+		it("is a no-op when the slug exists as an ignored entry (preserves Ignore)", async () => {
+			const ignoredEntry = makeEntry({ slug: "ignored-plan", ignored: true });
+			loadPlansRegistry.mockResolvedValue({
+				version: 1,
+				plans: { "ignored-plan": ignoredEntry },
+			});
+
+			await registerNewPlan("ignored-plan", CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+		});
+
+		it("skips silently when source file does not exist (addPlanToRegistry guard)", async () => {
+			loadPlansRegistry.mockResolvedValue(emptyRegistry());
+			// existsSync returns false → addPlanToRegistry returns early, no write
+			mockExistsSync.mockReturnValue(false);
+
+			await registerNewPlan("ghost-plan", CWD);
+
+			expect(savePlansRegistry).not.toHaveBeenCalled();
+		});
+	});
+
+	// ─── isPlanFromCurrentProject (cross-project attribution) ─────
+
+	describe("isPlanFromCurrentProject", () => {
+		const PLAN_ABS_PATH = "C:\\Users\\sanshi\\.claude\\plans\\my-plan.md";
+		const JSON_ESCAPED =
+			"C:\\\\Users\\\\sanshi\\\\.claude\\\\plans\\\\my-plan.md";
+
+		it("returns false when no sessions are tracked for the project", async () => {
+			loadAllSessions.mockResolvedValue([]);
+
+			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(
+				false,
+			);
+		});
+
+		it("returns true when one of the project's transcripts mentions the plan path", async () => {
+			loadAllSessions.mockResolvedValue([
+				{
+					sessionId: "s1",
+					transcriptPath: "/mock/session-1.jsonl",
+					updatedAt: "2026-04-20T00:00:00Z",
+				},
+			]);
+			// Transcript contains a Write tool_use referencing the plan
+			mockReadFile.mockResolvedValueOnce(
+				`{"type":"tool_use","name":"Write","input":{"file_path":"${JSON_ESCAPED}"}}\n`,
+			);
+
+			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(
+				true,
+			);
+		});
+
+		it("returns false when no transcript mentions the plan path (cross-project leak)", async () => {
+			loadAllSessions.mockResolvedValue([
+				{
+					sessionId: "s1",
+					transcriptPath: "/mock/session-1.jsonl",
+					updatedAt: "2026-04-20T00:00:00Z",
+				},
+			]);
+			// Transcript exists but contains only unrelated tool_use lines
+			mockReadFile.mockResolvedValueOnce(
+				`{"type":"tool_use","name":"Read","input":{"file_path":"/some/other/file.ts"}}\n`,
+			);
+
+			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(
+				false,
+			);
+		});
+
+		it("scans multiple transcripts and returns true on the first match", async () => {
+			loadAllSessions.mockResolvedValue([
+				{
+					sessionId: "s1",
+					transcriptPath: "/mock/session-1.jsonl",
+					updatedAt: "2026-04-20T00:00:00Z",
+				},
+				{
+					sessionId: "s2",
+					transcriptPath: "/mock/session-2.jsonl",
+					updatedAt: "2026-04-20T00:01:00Z",
+				},
+			]);
+			// First transcript: unrelated content
+			mockReadFile.mockResolvedValueOnce("{}");
+			// Second transcript: contains the plan path
+			mockReadFile.mockResolvedValueOnce(`"file_path":"${JSON_ESCAPED}"`);
+
+			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(
+				true,
+			);
+			expect(mockReadFile).toHaveBeenCalledTimes(2);
+		});
+
+		it("tolerates unreadable/missing transcripts without throwing", async () => {
+			loadAllSessions.mockResolvedValue([
+				{
+					sessionId: "s1",
+					transcriptPath: "/mock/missing.jsonl",
+					updatedAt: "2026-04-20T00:00:00Z",
+				},
+			]);
+			mockReadFile.mockRejectedValueOnce(new Error("ENOENT"));
+
+			await expect(isPlanFromCurrentProject(PLAN_ABS_PATH, CWD)).resolves.toBe(
+				false,
+			);
+		});
+	});
+});
