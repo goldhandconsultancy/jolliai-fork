@@ -93,6 +93,10 @@ const cliOptions = {
 		// Spawned by PrePushHook (detached per-push sync) AND by the CLI / VS Code
 		// activation compensation drain. Must exist as its own file in dist/.
 		{ in: `${jmSrc}/hooks/PrePushWorker.ts`,           out: "PrePushWorker" },
+		// Detached pull-side worker for Local Sync (self-hosted alternative to
+		// Personal Space Sync) — spawned by SessionStartHook.ts, must share a
+		// directory with it (see the "flatten into dist/" comment above).
+		{ in: `${jmSrc}/localsync/LocalSyncWorker.ts`,    out: "LocalSyncWorker" },
 		{ in: `${jmSrc}/hooks/GeminiAfterAgentHook.ts`,   out: "GeminiAfterAgentHook" },
 		{ in: `${jmSrc}/hooks/SessionStartHook.ts`,       out: "SessionStartHook" },
 		// Hermes' `on_session_end` hook + its detached discovery worker. Same

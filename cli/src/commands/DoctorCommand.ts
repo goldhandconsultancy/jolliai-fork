@@ -13,7 +13,7 @@
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Command } from "commander";
-import { orphanBranchExists } from "../core/GitOps.js";
+import { lsRemote, orphanBranchExists } from "../core/GitOps.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { isWorkerLockStale, releaseWorkerLock } from "../core/Locks.js";
 import { getBackend } from "../core/localagent/BackendRegistry.js";
@@ -64,7 +64,9 @@ import { getRepoRegistryPath, type RegistryRepair, repairRegistryEntries } from 
 import { traverseDistPaths } from "../install/DistPathResolver.js";
 import { getStatus, install } from "../install/Installer.js";
 import { createLogger, errMsg, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
+import { localSyncConflictExists } from "../localsync/LocalSyncStateStore.js";
 import { inspectPlugins } from "../PluginLoader.js";
+import { prepareAskpass } from "../sync/GitAskpass.js";
 import { resolveProjectDir, VERSION } from "./CliUtils.js";
 
 const log = createLogger("doctor");
@@ -552,6 +554,7 @@ async function runDoctor(cwd: string, fix: boolean, dryRun = false, forgetDead =
 		"anthropic-env": "Anthropic API key (ANTHROPIC_API_KEY env)",
 		"jolli-proxy": "Jolli proxy key",
 		"local-agent": `local agent (${localAgentToolLabel(localAgentTool)})`,
+		"azure-foundry": "Azure Foundry endpoint + key + deployment",
 	};
 	checks.push({
 		name: "Config",
@@ -661,6 +664,35 @@ async function runDoctor(cwd: string, fix: boolean, dryRun = false, forgetDead =
 				name: `plugin ${p.packageName}`,
 				status: "warn",
 				message: `v${version} requires @jolli.ai/cli ${p.peerRange}, but you have ${VERSION} — upgrade the CLI (npm update -g @jolli.ai/cli) or reinstall a compatible plugin (${p.installHint})`,
+			});
+		}
+	}
+
+	// 9. Local Sync — self-hosted sync destination health.
+	if (localSyncConflictExists(cwd)) {
+		checks.push({
+			name: "Local Sync",
+			status: "fail",
+			message: "unresolved conflict — run `jolli local-sync --force-push-mine` or `--force-take-theirs`",
+		});
+	} else if (config.localSyncEnabled && config.localSyncRepoUrl && config.localSyncToken) {
+		try {
+			const { env } = await prepareAskpass(config.localSyncToken);
+			const probe = await lsRemote(config.localSyncRepoUrl, undefined, cwd, env);
+			if (probe.exitCode === 0) {
+				checks.push({ name: "Local Sync", status: "ok", message: "destination reachable" });
+			} else {
+				checks.push({
+					name: "Local Sync",
+					status: "warn",
+					message: `destination unreachable — check localSyncRepoUrl / localSyncToken (${probe.stderr.split("\n")[0]})`,
+				});
+			}
+		} catch (err) {
+			checks.push({
+				name: "Local Sync",
+				status: "warn",
+				message: `reachability check failed: ${(err as Error).message}`,
 			});
 		}
 	}

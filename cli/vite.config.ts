@@ -261,6 +261,7 @@ export default defineConfig(({ mode }) => {
 					PrePushHook: resolve(__dirname, "src/hooks/PrePushHook.ts"),
 					PrePushWorker: resolve(__dirname, "src/hooks/PrePushWorker.ts"),
 					QueueWorker: resolve(__dirname, "src/hooks/QueueWorker.ts"),
+					LocalSyncWorker: resolve(__dirname, "src/localsync/LocalSyncWorker.ts"),
 					HermesStopHook: resolve(__dirname, "src/hooks/HermesStopHook.ts"),
 					HermesDiscoveryWorker: resolve(__dirname, "src/hooks/HermesDiscoveryWorker.ts"),
 					// No DashboardServerEntry: `jolli dashboard` serves in its own

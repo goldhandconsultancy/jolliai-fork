@@ -28,6 +28,7 @@ import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
 import { getHelpGroup } from "./commands/HelpGroups.js";
 import { registerIdeBridgeCommand } from "./commands/IdeBridgeRegistration.js";
 import { registerBindCommand, registerPushCommand, registerSpacesCommand } from "./commands/JolliCloudCommands.js";
+import { registerLocalSyncCommand } from "./commands/LocalSyncCommand.js";
 import { registerMcpCommand } from "./commands/McpCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
 import { registerMovedCommandNotices } from "./commands/MovedCommandNotices.js";
@@ -218,8 +219,8 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"auth",
 	"heal-folder",
 	"sync-memory-bank",
+	"local-sync",
 	"mcp",
-	"telemetry",
 	"push",
 	"spaces",
 	"bind",
@@ -428,16 +429,13 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerExportCommand(program);
 	registerAuthCommands(program);
 	registerSyncCommand(program);
+	registerLocalSyncCommand(program);
 	registerMcpCommand(program);
 	registerGlobalDaemonCommand(program);
 	registerTelemetryCommand(program);
 	registerGenerateCommand(program);
 	registerDaemonCommand(program);
 	registerIdeBridgeCommand(program);
-
-	// Auto-emit `command_invoked` for every command (built-in, plugin, future).
-	// No-op until telemetry is bootstrapped (Cli.ts), so harmless in tests.
-	installCommandTelemetryHooks(program);
 
 	// Plugin-provided command surface. `loadPlugins` discovers and registers
 	// installed plugins (returning the set of IDs it loaded); whatever's left

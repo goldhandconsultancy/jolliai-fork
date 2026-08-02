@@ -169,6 +169,7 @@ import { runSessionSync } from "../dashboard/SessionSyncRunner.js";
 import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { deriveSourceTag } from "../install/DistPathResolver.js";
 import { applyConfiguredLogLevel, createLogger, errMsg, getJolliMemoryDir, setLogDir } from "../Logger.js";
+import { runLocalSyncRound } from "../localsync/LocalSyncEngine.js";
 import { recordPendingIngest, wakePendingIngest } from "../sync/PendingIngest.js";
 import { recordPendingWorker, wakePendingWorkers } from "../sync/PendingWorkers.js";
 import { deriveMemoryBankRoot } from "../sync/SyncBootstrap.js";
@@ -896,6 +897,25 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 				await opportunisticSnapshot();
 				// Auto-cutover runs after the locks come off, not here.
 				summariesLandedThisRun = true;
+			}
+
+			// Local Sync push trigger (self-hosted alternative to Personal Space
+			// Sync — see LocalSyncEngine.ts's doc-comment): scheduled unconditionally
+			// on every drain completion, unlike the Space push trigger above which is
+			// gated on newlyGeneratedHashes.size > 0. A round with nothing new to push
+			// is a cheap no-op (one `git ls-remote` + tip comparison), and running it
+			// every drain lets a previously-offline push retry opportunistically.
+			// In-process `setImmediate`, not a spawned child: QueueWorker is already
+			// the detached background process, so a second spawn would only add
+			// startup cost — and running here (not from post-commit directly)
+			// guarantees this round sees the summary this drain just wrote, instead
+			// of racing the LLM call.
+			if (vaultLockConfig.localSyncEnabled) {
+				setImmediate(() => {
+					runLocalSyncRound(cwd).catch((err) => {
+						log.debug("Local Sync push trigger failed (will retry next drain): %s", errMsg(err));
+					});
+				});
 			}
 			/* v8 ignore start -- catch block only reached if dequeueAllGitOperations throws unexpectedly */
 		} catch (error: unknown) {
