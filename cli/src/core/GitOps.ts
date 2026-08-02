@@ -975,6 +975,27 @@ export async function resolveGitHooksDir(projectDir: string): Promise<string> {
 // rather than a URL-embedded token.
 
 /**
+ * `credential.helper=` (empty value clears the inherited list) +
+ * `credential.modalprompt=false`, prepended to every remote git call below.
+ * Mirrors `GIT_HARDENING_CONFIG` in `cli/src/sync/GitClient.ts` — the same
+ * problem applies here: `GIT_ASKPASS` (see `GitAskpass.ts`) only gets a shot
+ * when no credential helper resolves credentials first. Default Git for
+ * Windows installs configure Git Credential Manager at the system scope;
+ * without this override, `git fetch`/`push` ask GCM first, which either
+ * silently supplies a cached-but-wrong credential for a DIFFERENT repo
+ * (surfacing as a misleading "repository not found" against the correct
+ * Local Sync destination) or pops a modal sign-in dialog that hangs the
+ * detached worker indefinitely. Forcibly emptying the helper chain is the
+ * only way to guarantee the Local Sync token is the one actually used.
+ */
+const GIT_CREDENTIAL_HARDENING: ReadonlyArray<string> = Object.freeze([
+	"-c",
+	"credential.helper=",
+	"-c",
+	"credential.modalprompt=false",
+]);
+
+/**
  * Probes a remote without fetching anything (`git ls-remote <url> [refPattern]`).
  * Used both as a bare reachability/auth check (`refPattern` omitted) and to test
  * whether a specific ref exists on the remote (`refPattern` given) — an empty
@@ -989,7 +1010,7 @@ export async function lsRemote(
 	env?: NodeJS.ProcessEnv,
 ): Promise<GitCommandResult> {
 	const args = refPattern ? ["ls-remote", remoteUrl, refPattern] : ["ls-remote", remoteUrl];
-	return execGit(args, cwd, env);
+	return execGit([...GIT_CREDENTIAL_HARDENING, ...args], cwd, env);
 }
 
 /**
@@ -1005,7 +1026,7 @@ export async function fetchRefspec(
 	cwd?: string,
 	env?: NodeJS.ProcessEnv,
 ): Promise<GitCommandResult> {
-	return execGit(["fetch", "--no-tags", remoteUrl, refspec], cwd, env);
+	return execGit([...GIT_CREDENTIAL_HARDENING, "fetch", "--no-tags", remoteUrl, refspec], cwd, env);
 }
 
 /**
@@ -1020,7 +1041,7 @@ export async function pushRefspec(
 	cwd?: string,
 	env?: NodeJS.ProcessEnv,
 ): Promise<GitCommandResult> {
-	return execGit(["push", remoteUrl, refspec], cwd, env);
+	return execGit([...GIT_CREDENTIAL_HARDENING, "push", remoteUrl, refspec], cwd, env);
 }
 
 // --- Internal helpers ---
