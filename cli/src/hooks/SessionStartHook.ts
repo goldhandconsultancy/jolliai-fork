@@ -36,6 +36,7 @@ import { getDisplayDate } from "../core/SummaryFormat.js";
 import { getIndex } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
 import { createLogger, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
+import { spawnLocalSyncWorkerDetached } from "../localsync/LocalSyncWorker.js";
 import type { CommitSummary, DiffStats, JolliMemoryConfig, PlansRegistry, SummaryIndexEntry } from "../Types.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
 import { AUTH_FAILURE_REMINDER_TEXT } from "./AuthRemediation.js";
@@ -254,6 +255,15 @@ export async function main(): Promise<void> {
 			log.info("SessionStart hook skipped — repository manually disabled");
 			return;
 		}
+
+		// Local Sync pull trigger: fire-and-forget detached spawn, entirely
+		// outside the briefing's 500ms Promise.race budget below (a network
+		// fetch cannot run inline here). No-ops cheaply when Local Sync isn't
+		// configured/enabled — see LocalSyncEngine.runLocalSyncRound's early
+		// checks. The briefing this session start renders may therefore be a
+		// few seconds stale relative to another device's latest sync; that is
+		// an accepted tradeoff, not a bug.
+		spawnLocalSyncWorkerDetached(projectDir);
 
 		const context = await buildSessionStartContext(projectDir, "shared", {
 			includeBriefing: true,

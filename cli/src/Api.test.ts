@@ -685,7 +685,10 @@ describe("CLI", () => {
 			const siteHeader = helpOutput.indexOf("Jolli Site — Generate");
 			const spaceHeader = helpOutput.indexOf("Jolli Space — Sync docs");
 			const otherHeader = helpOutput.indexOf("Other commands:");
-			const syncIdx = helpOutput.indexOf("sync ");
+			// Anchored to the command-line indent (not a bare "sync " substring
+			// search) so this doesn't false-match the Jolli Memory section's
+			// own "local-sync" command, which also contains "sync ".
+			const syncIdx = helpOutput.indexOf("\n  sync ");
 
 			expect(spaceHeader).toBeGreaterThan(siteHeader);
 			// A representative Space command appears inside the Space section.

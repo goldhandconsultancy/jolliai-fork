@@ -267,8 +267,14 @@ export function isIngestOperation(op: GitOperation): op is IngestOperation {
  *   - "anthropic-config": apiKey set in ~/.jolli/jollimemory/config.json (direct mode)
  *   - "anthropic-env":    ANTHROPIC_API_KEY environment variable (direct mode)
  *   - "jolli-proxy":      jolliApiKey (sk-jol-…) routed through the Jolli backend
+ *   - "azure-foundry":    Azure AI Foundry / Azure OpenAI deployment via endpoint + key
  */
-export type LlmCredentialSource = "anthropic-config" | "anthropic-env" | "jolli-proxy" | "local-agent";
+export type LlmCredentialSource =
+	| "anthropic-config"
+	| "anthropic-env"
+	| "jolli-proxy"
+	| "local-agent"
+	| "azure-foundry";
 
 /** Metadata from the LLM API call that generated this summary */
 export interface LlmCallMetadata {
@@ -1069,7 +1075,17 @@ export interface CommitCatalog {
  */
 export type LlmConfig = Pick<
 	JolliMemoryConfig,
-	"apiKey" | "model" | "jolliApiKey" | "aiProvider" | "localAgentTool" | "localAgentPath"
+	| "apiKey"
+	| "model"
+	| "jolliApiKey"
+	| "aiProvider"
+	| "azureEndpoint"
+	| "azureApiKey"
+	| "azureDeployment"
+	| "azureApiVersion"
+	| "localAgentTool"
+	| "localAgentPath"
+	| "summaryLanguage"
 >;
 
 /** Configuration stored in .jolli/jollimemory/config.json */
@@ -1162,11 +1178,36 @@ export interface JolliMemoryConfig {
 	 * Which AI summarization provider to use.
 	 *  - "anthropic": call Anthropic directly using `apiKey`.
 	 *  - "jolli":     call Jolli's proxy using `jolliApiKey`.
+	 *  - "azure-foundry": call Azure AI Foundry / Azure OpenAI using
+	 *    `azureEndpoint`, `azureApiKey`, and `azureDeployment`.
 	 *
 	 * Optional — when missing, surfaces derive a default (Jolli when signed in,
 	 * Anthropic otherwise) so existing configs keep working.
 	 */
-	readonly aiProvider?: "anthropic" | "jolli" | "local-agent";
+	readonly aiProvider?: "anthropic" | "jolli" | "local-agent" | "azure-foundry";
+	/** Azure AI Foundry / Azure OpenAI endpoint (for example:
+	 *  https://<resource>.openai.azure.com). */
+	readonly azureEndpoint?: string;
+	/** Azure AI Foundry / Azure OpenAI API key (secret). */
+	readonly azureApiKey?: string;
+	/** Azure deployment name used for chat completions. */
+	readonly azureDeployment?: string;
+	/** Azure API version query string value (defaults in client when omitted). */
+	readonly azureApiVersion?: string;
+	/**
+	 * Free-text language name (e.g. "Dutch", "German") for reader-facing AI
+	 * output — commit/squash messages, summary titles/triggers/decisions,
+	 * recaps, E2E test instructions, and knowledge-wiki/graph text. Threaded
+	 * through every `callLlm` call via `llmCredentials()`
+	 * (`cli/src/core/LlmClient.ts`); see `buildLanguageDirective` there for
+	 * exactly what gets injected. Structural markers, JSON keys, IDs/slugs,
+	 * and code identifiers are explicitly excluded by that instruction, so
+	 * they stay in their original form regardless of this setting. Empty/unset
+	 * preserves the pre-existing behavior byte-for-byte (no directive is
+	 * injected at all). Not a fixed enum — deliberately open-ended so any
+	 * language name the model understands works without a code change.
+	 */
+	readonly summaryLanguage?: string;
 	/**
 	 * Which local Agent CLI tool to drive when `aiProvider` is "local-agent".
 	 * v1 supports only Claude Code; the enum is reserved for future tools
@@ -1308,6 +1349,33 @@ export interface JolliMemoryConfig {
 	readonly slack?: {
 		readonly workspaceUrl?: string;
 	};
+	/**
+	 * Enables Local Sync — a self-hosted alternative to Personal Space Sync that
+	 * mirrors this repo's orphan branch (`jollimemory/summaries/v3`) to a
+	 * dedicated private git repo the user owns, instead of Jolli's hosted
+	 * backend. Off by default. Requires `localSyncRepoUrl` and `localSyncToken`
+	 * to also be set; both trigger points (`QueueWorker`'s post-drain push,
+	 * `SessionStartHook`'s detached pull) treat a missing/false value as a cheap
+	 * no-op, so this is always safe to leave unset.
+	 */
+	readonly localSyncEnabled?: boolean;
+	/**
+	 * HTTPS clone URL of the dedicated private git repo used as the Local Sync
+	 * destination (e.g. "https://github.com/<you>/jolli-local-sync.git"). One
+	 * repo is shared across every local project — each project gets its own
+	 * branch inside it (see `LocalSyncBranchName.computeDestinationBranchName`).
+	 * HTTPS-only: the reused `GitAskpass` auth mechanism is token-over-HTTPS,
+	 * SSH remotes are not supported.
+	 */
+	readonly localSyncRepoUrl?: string;
+	/**
+	 * GitHub Personal Access Token for `localSyncRepoUrl` (secret). Stored as a
+	 * plain field in plaintext JSON — the same protection tier as `jolliApiKey` /
+	 * `azureApiKey` (no keychain integration exists anywhere in this codebase
+	 * today). Passed to git via the `GitAskpass` env-based shim, never embedded
+	 * in the remote URL.
+	 */
+	readonly localSyncToken?: string;
 }
 
 /** Result of enable/disable operations */

@@ -12,7 +12,7 @@
 
 import { join } from "node:path";
 import type { Command } from "commander";
-import { orphanBranchExists } from "../core/GitOps.js";
+import { lsRemote, orphanBranchExists } from "../core/GitOps.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { isWorkerLockStale, releaseWorkerLock } from "../core/Locks.js";
 import { getBackend } from "../core/localagent/BackendRegistry.js";
@@ -21,7 +21,9 @@ import { countActiveQueueEntries, getGlobalConfigDir, loadAllSessions, loadConfi
 import { traverseDistPaths } from "../install/DistPathResolver.js";
 import { getStatus, install } from "../install/Installer.js";
 import { createLogger, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
+import { localSyncConflictExists } from "../localsync/LocalSyncStateStore.js";
 import { inspectPlugins } from "../PluginLoader.js";
+import { prepareAskpass } from "../sync/GitAskpass.js";
 import { resolveProjectDir, VERSION } from "./CliUtils.js";
 
 const log = createLogger("doctor");
@@ -150,6 +152,7 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 		"anthropic-env": "Anthropic API key (ANTHROPIC_API_KEY env)",
 		"jolli-proxy": "Jolli proxy key",
 		"local-agent": "local agent (Claude Code subscription)",
+		"azure-foundry": "Azure Foundry endpoint + key + deployment",
 	};
 	checks.push({
 		name: "Config",
@@ -236,6 +239,41 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 				name: `plugin ${p.packageName}`,
 				status: "warn",
 				message: `v${version} requires @jolli.ai/cli ${p.peerRange}, but you have ${VERSION} — upgrade the CLI (npm update -g @jolli.ai/cli) or reinstall a compatible plugin (${p.installHint})`,
+			});
+		}
+	}
+
+	// 9. Local Sync — the self-hosted alternative to Personal Space Sync.
+	// An unresolved conflict is a fail (blocks further automatic syncing until
+	// the user runs `jolli local-sync --force-push-mine` / `--force-take-theirs`);
+	// otherwise, when enabled, probe reachability so a bad token/URL surfaces
+	// here instead of silently failing every background trigger. Not configured
+	// at all is the common case and stays silent (no check row) — Local Sync is
+	// opt-in, so an absent config is not itself a fault.
+	if (localSyncConflictExists(cwd)) {
+		checks.push({
+			name: "Local Sync",
+			status: "fail",
+			message: "unresolved conflict — run `jolli local-sync --force-push-mine` or `--force-take-theirs`",
+		});
+	} else if (config.localSyncEnabled && config.localSyncRepoUrl && config.localSyncToken) {
+		try {
+			const { env } = await prepareAskpass(config.localSyncToken);
+			const probe = await lsRemote(config.localSyncRepoUrl, undefined, cwd, env);
+			if (probe.exitCode === 0) {
+				checks.push({ name: "Local Sync", status: "ok", message: "destination reachable" });
+			} else {
+				checks.push({
+					name: "Local Sync",
+					status: "warn",
+					message: `destination unreachable — check localSyncRepoUrl / localSyncToken (${probe.stderr.split("\n")[0]})`,
+				});
+			}
+		} catch (err) {
+			checks.push({
+				name: "Local Sync",
+				status: "warn",
+				message: `reachability check failed: ${(err as Error).message}`,
 			});
 		}
 	}

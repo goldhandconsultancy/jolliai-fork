@@ -24,6 +24,7 @@ const VALID_AI_PROVIDERS: ReadonlyArray<NonNullable<JolliMemoryConfig["aiProvide
 	"anthropic",
 	"jolli",
 	"local-agent",
+	"azure-foundry",
 ];
 
 /** Valid values for the `localAgentTool` config key (v1 supports only Claude Code). */
@@ -71,7 +72,15 @@ const VALID_CONFIG_KEYS = [
 	"syncOnPush",
 	"localAgentTool",
 	"localAgentPath",
+	"azureEndpoint",
+	"azureApiKey",
+	"azureDeployment",
+	"azureApiVersion",
+	"summaryLanguage",
 	"slack.workspaceUrl",
+	"localSyncEnabled",
+	"localSyncRepoUrl",
+	"localSyncToken",
 ] as const satisfies ReadonlyArray<keyof JolliMemoryConfig | "slack.workspaceUrl">;
 
 type ConfigKey = (typeof VALID_CONFIG_KEYS)[number];
@@ -82,7 +91,13 @@ function isAllowedSlackHost(hostname: string): boolean {
 }
 
 /** Keys whose values should be masked when displayed (contain secrets). */
-const SENSITIVE_KEYS: ReadonlySet<string> = new Set(["apiKey", "jolliApiKey", "authToken"]);
+const SENSITIVE_KEYS: ReadonlySet<string> = new Set([
+	"apiKey",
+	"jolliApiKey",
+	"authToken",
+	"azureApiKey",
+	"localSyncToken",
+]);
 
 /** Returns true if the given string is a recognized config key. */
 function isValidConfigKey(key: string): key is ConfigKey {
@@ -140,7 +155,8 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		key === "antigravityEnabled" ||
 		key === "mcpPlatformToolsEnabled" ||
 		key === "syncTranscripts" ||
-		key === "syncOnPush"
+		key === "syncOnPush" ||
+		key === "localSyncEnabled"
 	) {
 		const lower = raw.toLowerCase();
 		if (lower === "true" || lower === "1" || lower === "yes") return true;
@@ -196,7 +212,40 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		// reconstruction can't produce a double slash from a trailing-slash input.
 		return parsed.origin;
 	}
-	// String fields (apiKey, model, jolliApiKey, authToken, localFolder, localAgentPath)
+	// String fields (apiKey, model, jolliApiKey, authToken, localFolder, localAgentPath, summaryLanguage)
+	if (key === "azureEndpoint") {
+		let parsed: URL;
+		try {
+			parsed = new URL(raw);
+		} catch {
+			throw new Error(`${key} must be a valid https URL (got: ${raw})`);
+		}
+		if (parsed.protocol !== "https:") {
+			throw new Error(`${key} must use https (got: ${raw})`);
+		}
+		// Unlike slack.workspaceUrl, this is NOT truncated to `origin` — a
+		// gateway/APIM front door (e.g. a full
+		// https://.../openai/v1/chat/completions route) carries the whole
+		// route in the path, and `callAzureFoundry` depends on that path
+		// surviving persistence to detect its pre-built-URL mode.
+		return raw.replace(/\/+$/, "");
+	}
+	// HTTPS-only: Local Sync's reused GitAskpass auth mechanism is
+	// token-over-HTTPS (see cli/src/sync/GitAskpass.ts) — an SSH remote
+	// (`git@host:owner/repo.git`, `ssh://...`) would silently never
+	// authenticate, so reject it up front rather than fail on first sync.
+	if (key === "localSyncRepoUrl") {
+		let parsed: URL;
+		try {
+			parsed = new URL(raw);
+		} catch {
+			throw new Error(`${key} must be a valid https:// git clone URL (got: ${raw})`);
+		}
+		if (parsed.protocol !== "https:") {
+			throw new Error(`${key} must use https (got: ${raw}) — SSH remotes are not supported`);
+		}
+		return raw;
+	}
 	return raw;
 }
 
@@ -256,7 +305,31 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 	{
 		key: "aiProvider",
 		type: "enum",
-		description: "AI summary provider: anthropic | jolli | local-agent (auto-set on `jolli auth login`)",
+		description:
+			"AI summary provider: anthropic | jolli | local-agent | azure-foundry (auto-set on `jolli auth login`)",
+	},
+	{
+		key: "azureEndpoint",
+		type: "string",
+		description:
+			"Azure AI Foundry / OpenAI endpoint: either a resource origin (https://<resource>.openai.azure.com) or a full gateway route ending in /chat/completions (e.g. an APIM front door)",
+	},
+	{ key: "azureApiKey", type: "string", description: "Azure AI Foundry / OpenAI API key (secret)" },
+	{
+		key: "azureDeployment",
+		type: "string",
+		description: "Azure deployment name; also sent as the request body's model field in gateway mode",
+	},
+	{
+		key: "azureApiVersion",
+		type: "string",
+		description: "Azure API version (optional; ignored in gateway mode unless explicitly set)",
+	},
+	{
+		key: "summaryLanguage",
+		type: "string",
+		description:
+			"Language for reader-facing AI output (commit messages, summaries, recaps, e2e tests, wiki text), e.g. 'Dutch'. Empty/unset = model default (English)",
 	},
 	{
 		key: "localAgentTool",
@@ -294,6 +367,22 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		type: "string",
 		description:
 			"Slack workspace base URL (https://<workspace>.slack.com) — fallback for thread permalinks when none was pasted",
+	},
+	{
+		key: "localSyncEnabled",
+		type: "boolean",
+		description:
+			"Enable Local Sync — self-hosted alternative to Personal Space Sync (mirrors the orphan branch to your own private repo; default: false)",
+	},
+	{
+		key: "localSyncRepoUrl",
+		type: "string",
+		description: "HTTPS clone URL of your dedicated private Local Sync repo (one repo shared across all projects)",
+	},
+	{
+		key: "localSyncToken",
+		type: "string",
+		description: "GitHub Personal Access Token for localSyncRepoUrl (secret)",
 	},
 ];
 

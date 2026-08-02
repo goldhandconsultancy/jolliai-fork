@@ -32,14 +32,25 @@ const log = createLogger("GitOps");
  * argv array, sidestepping CodeQL's `js/shell-command-constructed-from-input`
  * static-analysis alert (`spawn` with an args array never invokes a shell,
  * but CodeQL tracks taint conservatively).
+ *
+ * `env`, when provided, is an already-curated complete environment (e.g. the
+ * Local Sync / Personal Space Sync `GitAskpass` block) that REPLACES the
+ * child's inherited environment — matching `child_process`'s own semantics
+ * for an explicit `env` option. Omit it to inherit the parent process's env
+ * unchanged (the default, and every pre-existing call site's behavior).
  */
-export async function execGit(args: ReadonlyArray<string>, cwd?: string): Promise<GitCommandResult> {
+export async function execGit(
+	args: ReadonlyArray<string>,
+	cwd?: string,
+	env?: NodeJS.ProcessEnv,
+): Promise<GitCommandResult> {
 	log.debug("git %s%s", cwd ? `[cwd=${cwd}] ` : "", args.join(" "));
 
 	try {
 		const { stdout, stderr } = await execFileAsyncHidden("git", args, {
 			maxBuffer: MAX_GIT_BUFFER_BYTES,
 			...(cwd !== undefined && { cwd }),
+			...(env !== undefined && { env }),
 		});
 		const result: GitCommandResult = {
 			stdout: stdout.trimEnd(),
@@ -776,11 +787,47 @@ export async function writeMultipleFilesToBranch(
 	}
 	const parentCommit = tipResult.stdout.trim();
 
-	await runFastImport(branch, parentCommit, commitMessage, files, cwd);
+	await runFastImport(branch, [parentCommit], commitMessage, files, cwd);
 
 	const writeCount = files.filter((f) => !f.delete).length;
 	const deleteCount = files.filter((f) => f.delete).length;
 	log.info("Updated branch '%s': %d written, %d deleted (via fast-import)", branch, writeCount, deleteCount);
+}
+
+/**
+ * Writes a real two-parent merge commit to `branch` via `git fast-import`,
+ * for Local Sync's divergence-resolution path (`LocalSyncEngine.ts`). Unlike
+ * {@link writeMultipleFilesToBranch}, the caller supplies BOTH parents
+ * explicitly and neither is auto-resolved from the branch's current tip —
+ * `parentA` is expected to be the local orphan branch's tip and `parentB` the
+ * tip of a ref fetched from the Local Sync remote (see
+ * `GitOps.fetchRefspec`), so this does not call {@link ensureOrphanBranch}.
+ *
+ * `files` only needs to carry the delta on top of `parentA`'s tree (blobs
+ * unique to the remote side, plus the merged aggregate file(s)) — fast-import
+ * applies the `M`/`D` directives on top of `from <parentA>` the same way
+ * {@link writeMultipleFilesToBranch} does for a single-parent commit.
+ *
+ * Using a real second-parent (`merge <parentB>`) rather than an invented
+ * single-parent "logical merge" matters: it makes `parentB` a genuine
+ * ancestor of the new tip, so a subsequent {@link isAncestor} check correctly
+ * sees convergence instead of re-detecting divergence on every future round.
+ */
+export async function writeMergeCommitToBranch(
+	branch: string,
+	parentA: string,
+	parentB: string,
+	files: ReadonlyArray<FileWrite>,
+	commitMessage: string,
+	cwd?: string,
+): Promise<void> {
+	await runFastImport(branch, [parentA, parentB], commitMessage, files, cwd);
+	log.info(
+		"Wrote merge commit to branch '%s' (parents: %s, %s)",
+		branch,
+		parentA.substring(0, 8),
+		parentB.substring(0, 8),
+	);
 }
 
 /**
@@ -918,6 +965,64 @@ export async function resolveGitHooksDir(projectDir: string): Promise<string> {
 	return join(resolvedGitDir, "hooks");
 }
 
+// --- Local Sync remote operations ---
+//
+// Plain `git ls-remote` / `fetch` / `push` wrappers used by
+// `cli/src/localsync/LocalSyncEngine.ts`. Deliberately thin: every call takes
+// the destination URL as a literal argument (never `git remote add`), so
+// nothing is written to the caller's own `.git/config`, and `env` is always
+// the caller-supplied `GitAskpass` block (see `cli/src/sync/GitAskpass.ts`)
+// rather than a URL-embedded token.
+
+/**
+ * Probes a remote without fetching anything (`git ls-remote <url> [refPattern]`).
+ * Used both as a bare reachability/auth check (`refPattern` omitted) and to test
+ * whether a specific ref exists on the remote (`refPattern` given) — an empty
+ * `stdout` on a zero exit code means "reachable, but the ref doesn't exist"
+ * (the bootstrap case), which callers must distinguish from a non-zero exit
+ * (unreachable / unauthenticated / repo missing).
+ */
+export async function lsRemote(
+	remoteUrl: string,
+	refPattern: string | undefined,
+	cwd?: string,
+	env?: NodeJS.ProcessEnv,
+): Promise<GitCommandResult> {
+	const args = refPattern ? ["ls-remote", remoteUrl, refPattern] : ["ls-remote", remoteUrl];
+	return execGit(args, cwd, env);
+}
+
+/**
+ * Fetches `refspec` from `remoteUrl` into the local ref namespace the refspec
+ * names — callers use a private `refs/jolli-local-sync/...` destination (never
+ * `refs/heads/*` or `refs/remotes/*`) so the fetched ref never shows up in
+ * `git branch` and no `git remote add` is required. `--no-tags` keeps the
+ * operation scoped to exactly the requested ref.
+ */
+export async function fetchRefspec(
+	remoteUrl: string,
+	refspec: string,
+	cwd?: string,
+	env?: NodeJS.ProcessEnv,
+): Promise<GitCommandResult> {
+	return execGit(["fetch", "--no-tags", remoteUrl, refspec], cwd, env);
+}
+
+/**
+ * Pushes `refspec` to `remoteUrl`. Deliberately never passes `--force` /
+ * `--force-with-lease` — a rejected non-fast-forward push is the correctness
+ * backstop against clobbering a remote that moved between fetch and push;
+ * callers must re-fetch and re-resolve rather than retry with force.
+ */
+export async function pushRefspec(
+	remoteUrl: string,
+	refspec: string,
+	cwd?: string,
+	env?: NodeJS.ProcessEnv,
+): Promise<GitCommandResult> {
+	return execGit(["push", remoteUrl, refspec], cwd, env);
+}
+
 // --- Internal helpers ---
 
 /**
@@ -1025,10 +1130,17 @@ async function getGitIdent(varName: "GIT_AUTHOR_IDENT" | "GIT_COMMITTER_IDENT", 
  * a commit before fast-import runs, this call fails fast instead of silently
  * clobbering them. (Upstream serialization via `orphan-write.lock` is the
  * primary defense; this is the secondary one.)
+ *
+ * `parents` is one SHA for a normal single-parent commit (the only case until
+ * Local Sync), or two for a real merge commit ({@link writeMergeCommitToBranch}):
+ * the second SHA is emitted as fast-import's native `merge <sha>` directive
+ * right after `from <parents[0]>`, producing genuine two-parent ancestry
+ * (not an invented "logical merge") so later `git merge-base --is-ancestor`
+ * checks see the merged side as converged.
  */
 async function runFastImport(
 	branch: string,
-	parent: string,
+	parents: readonly [string] | readonly [string, string],
 	commitMessage: string,
 	files: ReadonlyArray<FileWrite>,
 	cwd?: string,
@@ -1100,8 +1212,13 @@ async function runFastImport(
 			`data ${msg.length}\n`,
 			msg,
 			"\n",
-			`from ${parent}\n`,
+			`from ${parents[0]}\n`,
 		);
+		if (parents.length === 2) {
+			// Native fast-import second-parent directive — must immediately follow
+			// `from`. Produces a real merge commit (see writeMergeCommitToBranch).
+			chunks.push(`merge ${parents[1]}\n`);
+		}
 		writes.forEach((f, idx) => {
 			chunks.push(`M 100644 :${idx + 1} ${quoteFastImportPath(f.path)}\n`);
 		});

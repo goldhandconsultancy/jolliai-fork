@@ -25,6 +25,7 @@ import { registerHealFolderCommand } from "./commands/HealFolderCommand.js";
 import { getHelpGroup } from "./commands/HelpGroups.js";
 import { registerIdeBridgeCommand } from "./commands/IdeBridgeRegistration.js";
 import { registerBindCommand, registerPushCommand, registerSpacesCommand } from "./commands/JolliCloudCommands.js";
+import { registerLocalSyncCommand } from "./commands/LocalSyncCommand.js";
 import { registerMcpCommand } from "./commands/McpCommand.js";
 import { registerMigrateCommand } from "./commands/MigrateCommand.js";
 import { registerMigrateMemoryBankCommand } from "./commands/MigrateMemoryBankCommand.js";
@@ -36,7 +37,6 @@ import { registerRecallCommand } from "./commands/RecallCommand.js";
 import { registerSearchCommand } from "./commands/SearchCommand.js";
 import { registerStatusCommand } from "./commands/StatusCommand.js";
 import { registerSyncCommand } from "./commands/SyncCommand.js";
-import { registerTelemetryCommand } from "./commands/TelemetryCommand.js";
 import { registerUninstallCommand } from "./commands/UninstallCommand.js";
 import { registerViewCommand } from "./commands/ViewCommand.js";
 // _parseJolliApiKey / _parseBaseUrl: re-exposed at the bottom of this file.
@@ -44,7 +44,6 @@ import { registerViewCommand } from "./commands/ViewCommand.js";
 // pure re-exports from the entry bundle when nothing inside the entry
 // consumes them).
 import { parseBaseUrl as _parseBaseUrl, parseJolliApiKey as _parseJolliApiKey } from "./core/JolliApiUtils.js";
-import { installCommandTelemetryHooks } from "./core/TelemetryCommandHook.js";
 import { CLI_PACKAGE_NAME, REFRESH_COMMAND, refreshUpdateCache } from "./core/UpdateCheck.js";
 import { autoRefreshSkillsIfStale } from "./install/SkillAutoRefresh.js";
 import type { Logger } from "./Logger.js";
@@ -188,8 +187,8 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"auth",
 	"heal-folder",
 	"sync-memory-bank",
+	"local-sync",
 	"mcp",
-	"telemetry",
 	"push",
 	"spaces",
 	"bind",
@@ -394,15 +393,11 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerExportCommand(program);
 	registerAuthCommands(program);
 	registerSyncCommand(program);
+	registerLocalSyncCommand(program);
 	registerMcpCommand(program);
-	registerTelemetryCommand(program);
 	registerGenerateCommand(program);
 	registerDaemonCommand(program);
 	registerIdeBridgeCommand(program);
-
-	// Auto-emit `command_invoked` for every command (built-in, plugin, future).
-	// No-op until telemetry is bootstrapped (Cli.ts), so harmless in tests.
-	installCommandTelemetryHooks(program);
 
 	// Plugin-provided command surface. `loadPlugins` discovers and registers
 	// installed plugins (returning the set of IDs it loaded); whatever's left

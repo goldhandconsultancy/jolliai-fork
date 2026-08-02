@@ -83,6 +83,7 @@ export default defineConfig({
 				PrePushHook: resolve(__dirname, "src/hooks/PrePushHook.ts"),
 				PrePushWorker: resolve(__dirname, "src/hooks/PrePushWorker.ts"),
 				QueueWorker: resolve(__dirname, "src/hooks/QueueWorker.ts"),
+				LocalSyncWorker: resolve(__dirname, "src/localsync/LocalSyncWorker.ts"),
 			},
 			formats: ["es"],
 		},
