@@ -1,0 +1,839 @@
+/**
+ * SettingsScriptBuilder
+ *
+ * Returns the JavaScript embedded in the Settings webview for:
+ *  - Tab switching between AI Agents / AI Summary / Sync to Jolli / Memory Bank / Others
+ *  - Provider card switching in AI Summary (Anthropic vs Jolli sub-states)
+ *  - Sync to Jolli card switching (signed-in vs signed-out)
+ *  - Advanced (Jolli API Key) toggle
+ *  - Sign-in / Sign-out wiring (extension host commands)
+ *  - Form state management, dirty tracking, validation, masking detection
+ *
+ * Pure string template — no logic dependencies on other view modules.
+ */
+
+import { ALLOWED_JOLLI_HOSTS } from "../../../cli/src/core/JolliApiUtils.js";
+import { buildContextMenuGuardScript } from "./ContextMenuGuard.js";
+
+/** Returns the JavaScript for the Settings webview interactions. */
+export function buildSettingsScript(): string {
+	return `
+  ${buildContextMenuGuardScript()}
+
+  const vscode = acquireVsCodeApi();
+
+  // ── DOM references ──
+  const apiKeyInput = document.getElementById('apiKey');
+  const modelSelect = document.getElementById('model');
+  const maxTokensInput = document.getElementById('maxTokens');
+  const aiProviderSelect = document.getElementById('aiProvider');
+  const localAgentToolSelect = document.getElementById('localAgentTool');
+  const azureEndpointInput = document.getElementById('azureEndpoint');
+  const azureApiKeyInput = document.getElementById('azureApiKey');
+  const azureDeploymentInput = document.getElementById('azureDeployment');
+  const azureApiVersionInput = document.getElementById('azureApiVersion');
+  // Two Jolli API key inputs (jolli-ok and jolli-nokey cards) — kept in sync.
+  const jolliApiKeyInput = document.getElementById('jolliApiKey');
+  const jolliApiKeyNoKeyInput = document.getElementById('jolliApiKeyNoKey');
+  const jolliSiteLabel = document.getElementById('jolliSiteLabel');
+  const claudeEnabledInput = document.getElementById('claudeEnabled');
+  const codexEnabledInput = document.getElementById('codexEnabled');
+  const geminiEnabledInput = document.getElementById('geminiEnabled');
+  const openCodeEnabledInput = document.getElementById('openCodeEnabled');
+  const cursorEnabledInput = document.getElementById('cursorEnabled');
+  const devinEnabledInput = document.getElementById('devinEnabled');
+  const copilotEnabledInput = document.getElementById('copilotEnabled');
+  const clineEnabledInput = document.getElementById('clineEnabled');
+  const antigravityEnabledInput = document.getElementById('antigravityEnabled');
+  const globalInstructionsInput = document.getElementById('globalInstructions');
+  const localFolderInput = document.getElementById('localFolder');
+  const browseLocalFolderBtn = document.getElementById('browseLocalFolderBtn');
+  const rebuildKbBtn = document.getElementById('rebuildKbBtn');
+  const rebuildKbStatus = document.getElementById('rebuildKbStatus');
+  const generateSummariesBtn = document.getElementById('generateSummariesBtn');
+  const generateSummariesStatus = document.getElementById('generateSummariesStatus');
+  const missingSummariesCount = document.getElementById('missingSummariesCount');
+  const excludePatternsInput = document.getElementById('excludePatterns');
+  const compileExcludeFoldersInput = document.getElementById('compileExcludeFolders');
+  const dcoSignoffInput = document.getElementById('dcoSignoff');
+  const applyBtn = document.getElementById('applyBtn');
+  const saveFeedback = document.getElementById('saveFeedback');
+  const anthropicMissingWarn = document.getElementById('anthropicMissingWarn');
+  const summarySignInBtn = document.getElementById('summarySignInBtn');
+  const summaryReLoginBtn = document.getElementById('summaryReLoginBtn');
+  const syncSignInBtn = document.getElementById('syncSignInBtn');
+  const syncSignOutBtn = document.getElementById('syncSignOutBtn');
+  const autoSyncEnabledInput = document.getElementById('autoSyncEnabled');
+  const syncTranscriptsInput = document.getElementById('syncTranscripts');
+  const syncPollIntervalMinInput = document.getElementById('syncPollIntervalMin');
+  const syncNowBtn = document.getElementById('syncNowBtn');
+  const mcpPlatformToolsEnabledInput = document.getElementById('mcpPlatformToolsEnabled');
+  const summaryLanguageInput = document.getElementById('summaryLanguage');
+  const localAgentPathInput = document.getElementById('localAgentPath');
+  const openUrlAllowedOriginsInput = document.getElementById('openUrlAllowedOrigins');
+  const logLevelSelect = document.getElementById('logLevel');
+  const logLevelOverridesJsonInput = document.getElementById('logLevelOverridesJson');
+
+  // ── State ──
+  let maskedApiKey = '';
+  let maskedJolliApiKey = '';
+  let initialState = {};
+  let isDirty = false;
+  let hasErrors = false;
+  // Auth state pushed by the extension host (settingsLoaded + authStateChanged).
+  let signedIn = false;
+  let hasJolliKey = false;
+  // Set when the user confirmed "Apply Changes & Migrate" in the dirty-folder
+  // dialog. We fire applySettings first, then chain into rebuildKnowledgeBase
+  // on settingsSaved (and abort the chain on settingsError so the migrate
+  // never runs against unsaved/invalid state).
+  let pendingMigrateAfterApply = false;
+  // Same pattern as pendingMigrateAfterApply, but for Sync now: when the user
+  // clicks while form is dirty we chain Apply -> syncNow on settingsSaved,
+  // and abort on settingsError so a rejected save never silently triggers
+  // a round against stale config.
+  let pendingSyncAfterApply = false;
+
+  // ── Tab switching ──
+  // Match by data-tab on the button to data-panel on the section. Use the
+  // shared .hidden class so the tab toggle doesn't fight any other display:*
+  // declared on the panel (matches the project's webview convention — see
+  // CLAUDE.md / feedback memory).
+  document.querySelectorAll('.tab-button').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var target = btn.getAttribute('data-tab');
+      document.querySelectorAll('.tab-button').forEach(function(b) {
+        b.classList.toggle('tab-active', b === btn);
+      });
+      document.querySelectorAll('.tab-panel').forEach(function(p) {
+        var matches = p.getAttribute('data-panel') === target;
+        p.classList.toggle('hidden', !matches);
+      });
+    });
+  });
+
+  // ── Provider / Sync card switching ──
+  function syncProviderCard() {
+    var provider = aiProviderSelect.value;
+    var which;
+    if (provider === 'anthropic') {
+      which = 'anthropic';
+    } else if (provider === 'azure-foundry') {
+      which = 'azure-foundry';
+    } else if (provider === 'local-agent') {
+      which = 'local-agent';
+    } else if (signedIn && hasJolliKey) {
+      which = 'jolli-ok';
+    } else if (signedIn && !hasJolliKey) {
+      which = 'jolli-nokey';
+    } else {
+      which = 'jolli-signin';
+    }
+    document.querySelectorAll('[data-card]').forEach(function(c) {
+      c.classList.toggle('hidden', c.getAttribute('data-card') !== which);
+    });
+    if (provider === 'anthropic') {
+      // Re-evaluate the missing-key warning whenever the Anthropic card shows.
+      updateAnthropicWarning();
+    }
+  }
+
+  function syncSyncCard() {
+    // Sync tab: signed-in if both signedIn AND hasJolliKey (matches IntelliJ
+    // CARD_SYNC_SIGNEDIN gating). Otherwise show signed-out — the user signs
+    // in (or pastes a key in AI Summary > Advanced) to reach the signed-in
+    // state. Keeping a single binary card here avoids a duplicate "no key"
+    // surface; AI Summary is where the missing-key recovery flow lives.
+    var which = (signedIn && hasJolliKey) ? 'signed-in' : 'signed-out';
+    document.querySelectorAll('[data-sync-card]').forEach(function(c) {
+      c.classList.toggle('hidden', c.getAttribute('data-sync-card') !== which);
+    });
+  }
+
+  function updateAnthropicWarning() {
+    var hasKey = apiKeyInput.value.trim().length > 0;
+    anthropicMissingWarn.classList.toggle('hidden', hasKey);
+  }
+
+  // ── Advanced (Jolli API Key) toggles ──
+  document.querySelectorAll('.advanced-link').forEach(function(link) {
+    link.addEventListener('click', function() {
+      var key = link.getAttribute('data-advanced');
+      var panel = document.querySelector('[data-advanced-panel="' + key + '"]');
+      if (!panel) return;
+      var willOpen = panel.classList.contains('hidden');
+      panel.classList.toggle('hidden', !willOpen);
+      link.textContent = willOpen ? 'Hide Advanced' : 'Advanced';
+    });
+  });
+
+  // ── Sign-in / Sign-out buttons ──
+  function postSignIn() { vscode.postMessage({ command: 'signIn' }); }
+  function postSignOut() { vscode.postMessage({ command: 'signOut' }); }
+  if (summarySignInBtn) summarySignInBtn.addEventListener('click', postSignIn);
+  if (syncSignInBtn) syncSignInBtn.addEventListener('click', postSignIn);
+  if (summaryReLoginBtn) summaryReLoginBtn.addEventListener('click', postSignOut);
+  if (syncSignOutBtn) syncSignOutBtn.addEventListener('click', postSignOut);
+
+  // ── Validation ──
+  // Sourced from cli/src/core/JolliApiUtils.ts at extension build time so the
+  // CLI's authoritative allowlist and the webview's validator can't drift.
+  var ALLOWED_JOLLI_HOSTS = ${JSON.stringify(ALLOWED_JOLLI_HOSTS)};
+
+  function decodeBase64url(seg) {
+    try {
+      var b64 = seg.replace(/-/g, '+').replace(/_/g, '/');
+      var pad = b64.length % 4;
+      if (pad === 2) b64 += '==';
+      else if (pad === 3) b64 += '=';
+      else if (pad === 1) return null;
+      return atob(b64);
+    } catch (e) { return null; }
+  }
+
+  function checkJolliOriginAllowed(origin) {
+    try {
+      var u = new URL(origin);
+      var host = u.hostname.toLowerCase();
+      if (u.protocol !== 'https:' || !host) return false;
+      for (var i = 0; i < ALLOWED_JOLLI_HOSTS.length; i++) {
+        var h = ALLOWED_JOLLI_HOSTS[i];
+        if (host === h || host.slice(-(h.length + 1)) === '.' + h) return true;
+      }
+      return false;
+    } catch (e) { return false; }
+  }
+
+  // Inline port of cli/src/core/JolliApiUtils.ts validateJolliApiKey — this
+  // runs in the webview's browser context so it can't just import the Node
+  // module. Keep in lockstep with the CLI version (and the Kotlin port in
+  // intellij/.../JolliApiClient.kt). Runs on every keystroke for inline red
+  // feedback; the server-side check in handleApplySettings is authoritative.
+  function validateJolliApiKeyRule(v) {
+    if (v.length === 0 || v === maskedJolliApiKey) return '';
+    if (!v.startsWith('sk-jol-')) return 'Key cannot be decoded. Paste the key exactly as issued by Jolli.';
+    var rest = v.slice('sk-jol-'.length);
+    if (rest.indexOf('.') < 0) {
+      return 'Key cannot be decoded. Paste the key exactly as issued by Jolli.';
+    }
+    var segments = rest.split('.');
+    for (var i = 0; i < segments.length; i++) {
+      var json = decodeBase64url(segments[i]);
+      if (json === null) continue;
+      try {
+        var meta = JSON.parse(json);
+        if (typeof meta.t === 'string' && typeof meta.u === 'string') {
+          if (!checkJolliOriginAllowed(meta.u)) {
+            return 'Origin ' + meta.u + ' is not on the Jolli allowlist (only *.jolli.ai, *.jolli.dev, *.jolli.cloud, *.jolli-local.me).';
+          }
+          return '';
+        }
+      } catch (e) { /* try next segment */ }
+    }
+    return 'Key cannot be decoded. Paste the key exactly as issued by Jolli.';
+  }
+
+  function validateField(input, errorId, rule) {
+    var errorEl = document.getElementById(errorId);
+    var value = input.value.trim();
+    var msg = rule(value);
+    if (msg) {
+      input.classList.add('error');
+      if (errorEl) errorEl.textContent = msg;
+    } else {
+      input.classList.remove('error');
+      if (errorEl) errorEl.textContent = '';
+    }
+    return !msg;
+  }
+
+  function validateAll() {
+    var valid = true;
+    valid = validateField(apiKeyInput, 'apiKey-error', function(v) {
+      if (v.length > 0 && v !== maskedApiKey) {
+        if (!v.startsWith('sk-ant-')) return 'Must start with sk-ant-';
+        if (v.length < 20) return 'Key looks incomplete';
+      }
+      return '';
+    }) && valid;
+    // Validate only the Jolli key input whose card is currently visible.
+    // The two inputs are kept in sync by paired listeners, but in transient
+    // states (advanced panel collapsed, programmatic setValue race) one may
+    // briefly hold a stale value — running the rule on a hidden input would
+    // surface its error in a card the user can't see, blocking Apply with
+    // no visible cause. When neither Jolli card is in scope (Anthropic
+    // selected, or signed-out) we skip Jolli validation entirely so a
+    // residual value can't gate Apply.
+    var jolliOkCard = document.querySelector('[data-card="jolli-ok"]');
+    var jolliNokeyCard = document.querySelector('[data-card="jolli-nokey"]');
+    if (jolliOkCard && !jolliOkCard.classList.contains('hidden')) {
+      valid = validateField(jolliApiKeyInput, 'jolliApiKey-error', validateJolliApiKeyRule) && valid;
+    } else if (jolliNokeyCard && !jolliNokeyCard.classList.contains('hidden')) {
+      valid = validateField(jolliApiKeyNoKeyInput, 'jolliApiKeyNoKey-error', validateJolliApiKeyRule) && valid;
+    }
+    valid = validateField(maxTokensInput, 'maxTokens-error', function(v) {
+      if (v.length > 0 && (isNaN(Number(v)) || Number(v) < 1 || !Number.isInteger(Number(v)))) return 'Must be a positive integer';
+      return '';
+    }) && valid;
+    if (aiProviderSelect.value === 'azure-foundry') {
+      valid = validateField(azureEndpointInput, 'azureEndpoint-error', function(v) {
+        if (v.length === 0) return 'Azure endpoint is required';
+        try {
+          var u = new URL(v);
+          if (u.protocol !== 'https:') return 'Endpoint must use https';
+        } catch (e) {
+          return 'Endpoint must be a valid URL';
+        }
+        return '';
+      }) && valid;
+      valid = validateField(azureApiKeyInput, 'azureApiKey-error', function(v) {
+        if (v.length === 0) return 'Azure API key is required';
+        return '';
+      }) && valid;
+      valid = validateField(azureDeploymentInput, 'azureDeployment-error', function(v) {
+        if (v.length === 0) return 'Azure deployment is required';
+        return '';
+      }) && valid;
+    }
+    valid = validateField(localAgentPathInput, 'localAgentPath-error', function(v) {
+      if (v.length > 0 && !v.startsWith('/')) return 'Path must be absolute';
+      return '';
+    }) && valid;
+    valid = validateField(openUrlAllowedOriginsInput, 'openUrlAllowedOrigins-error', function(v) {
+      if (v.length === 0) return '';
+      var parts = v.split(',').map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
+      for (var i = 0; i < parts.length; i++) {
+        var p = parts[i];
+        if (p.indexOf('://') >= 0) {
+          try {
+            var u = new URL(p);
+            if (u.protocol !== 'https:') return 'Origins must use https';
+            if (!u.hostname) return 'Invalid origin: ' + p;
+          } catch (e) {
+            return 'Invalid origin: ' + p;
+          }
+        } else {
+          if (!/^[a-z0-9.-]+$/i.test(p) || p.indexOf('.') === -1) {
+            return 'Invalid host: ' + p;
+          }
+        }
+      }
+      return '';
+    }) && valid;
+    valid = validateField(logLevelOverridesJsonInput, 'logLevelOverridesJson-error', function(v) {
+      if (v.length === 0) return '';
+      var parsed;
+      try {
+        parsed = JSON.parse(v);
+      } catch (e) {
+        return 'Must be valid JSON';
+      }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return 'Must be a JSON object';
+      var allowed = { debug: true, info: true, warn: true, error: true };
+      for (var k in parsed) {
+        if (Object.prototype.hasOwnProperty.call(parsed, k)) {
+          if (typeof parsed[k] !== 'string' || !allowed[parsed[k]]) {
+            return 'Override values must be one of: debug, info, warn, error';
+          }
+        }
+      }
+      return '';
+    }) && valid;
+    // At least one integration must be enabled
+    var intError = document.getElementById('integrations-error');
+    if (!claudeEnabledInput.checked && !codexEnabledInput.checked && !geminiEnabledInput.checked && !openCodeEnabledInput.checked && !cursorEnabledInput.checked && !copilotEnabledInput.checked && !clineEnabledInput.checked && !devinEnabledInput.checked && !antigravityEnabledInput.checked) {
+      intError.textContent = 'At least one integration must be enabled';
+      valid = false;
+    } else {
+      intError.textContent = '';
+    }
+    hasErrors = !valid;
+    updateApplyBtn();
+  }
+
+  // ── Memory Bank helpers ──
+  browseLocalFolderBtn.addEventListener('click', function() {
+    vscode.postMessage({ command: 'browseLocalFolder' });
+  });
+
+  function localFolderDirty() {
+    return localFolderInput.value !== initialState.localFolder;
+  }
+
+  function startRebuild() {
+    rebuildKbBtn.disabled = true;
+    rebuildKbStatus.textContent = 'Rebuilding…';
+    vscode.postMessage({ command: 'rebuildKnowledgeBase' });
+  }
+
+  rebuildKbBtn.addEventListener('click', function() {
+    if (rebuildKbBtn.disabled) return;
+    if (localFolderDirty()) {
+      // Host will show a native modal warning and post back the user's choice
+      // via 'confirmDirtyMigrateResult'. Don't disable the button yet so a
+      // Cancel leaves the UI exactly as the user left it.
+      vscode.postMessage({ command: 'confirmDirtyMigrate' });
+      return;
+    }
+    startRebuild();
+  });
+
+  if (generateSummariesBtn) {
+    generateSummariesBtn.addEventListener('click', function() {
+      if (generateSummariesBtn.disabled) return;
+      generateSummariesBtn.disabled = true;
+      if (generateSummariesStatus) generateSummariesStatus.textContent = 'Generating… (see notification for progress)';
+      vscode.postMessage({ command: 'generateMissingSummaries' });
+    });
+  }
+
+  // ── Dirty tracking ──
+  function getActiveJolliApiKeyValue() {
+    // Prefer whichever input's card is currently visible. The two inputs are
+    // kept in sync by the input listeners below, so under normal interaction
+    // they'll match anyway — this just disambiguates after a programmatic
+    // setValue (e.g. on settingsLoaded).
+    var okCard = document.querySelector('[data-card="jolli-ok"]');
+    if (okCard && !okCard.classList.contains('hidden')) return jolliApiKeyInput.value;
+    var nokeyCard = document.querySelector('[data-card="jolli-nokey"]');
+    if (nokeyCard && !nokeyCard.classList.contains('hidden')) return jolliApiKeyNoKeyInput.value;
+    // Neither advanced card visible — fall back to the last-loaded masked
+    // value so dirty tracking sees no change.
+    return jolliApiKeyInput.value;
+  }
+
+  function captureInitialState() {
+    initialState = {
+      apiKey: apiKeyInput.value,
+      model: modelSelect.value,
+      maxTokens: maxTokensInput.value,
+      aiProvider: aiProviderSelect.value,
+      localAgentTool: localAgentToolSelect.value,
+      azureEndpoint: azureEndpointInput.value,
+      azureApiKey: azureApiKeyInput.value,
+      azureDeployment: azureDeploymentInput.value,
+      azureApiVersion: azureApiVersionInput.value,
+      jolliApiKey: getActiveJolliApiKeyValue(),
+      claudeEnabled: claudeEnabledInput.checked,
+      codexEnabled: codexEnabledInput.checked,
+      geminiEnabled: geminiEnabledInput.checked,
+      openCodeEnabled: openCodeEnabledInput.checked,
+      cursorEnabled: cursorEnabledInput.checked,
+      devinEnabled: devinEnabledInput.checked,
+      copilotEnabled: copilotEnabledInput.checked,
+      clineEnabled: clineEnabledInput.checked,
+      antigravityEnabled: antigravityEnabledInput.checked,
+      globalInstructions: globalInstructionsInput.checked,
+      localFolder: localFolderInput.value,
+      excludePatterns: excludePatternsInput.value,
+      compileExcludeFolders: compileExcludeFoldersInput.value,
+      dcoSignoff: dcoSignoffInput.checked,
+      autoSyncEnabled: autoSyncEnabledInput ? autoSyncEnabledInput.checked : false,
+      syncTranscripts: syncTranscriptsInput ? syncTranscriptsInput.checked : false,
+      syncPollIntervalMin: syncPollIntervalMinInput ? syncPollIntervalMinInput.value : '',
+      mcpPlatformToolsEnabled: mcpPlatformToolsEnabledInput ? mcpPlatformToolsEnabledInput.checked : false,
+      summaryLanguage: summaryLanguageInput ? summaryLanguageInput.value : '',
+      localAgentPath: localAgentPathInput ? localAgentPathInput.value : '',
+      openUrlAllowedOrigins: openUrlAllowedOriginsInput ? openUrlAllowedOriginsInput.value : '',
+      logLevel: logLevelSelect ? logLevelSelect.value : '',
+      logLevelOverridesJson: logLevelOverridesJsonInput ? logLevelOverridesJsonInput.value : '',
+    };
+    checkDirty();
+  }
+
+  function checkDirty() {
+    isDirty = (
+      apiKeyInput.value !== initialState.apiKey ||
+      modelSelect.value !== initialState.model ||
+      maxTokensInput.value !== initialState.maxTokens ||
+      aiProviderSelect.value !== initialState.aiProvider ||
+      localAgentToolSelect.value !== initialState.localAgentTool ||
+      azureEndpointInput.value !== initialState.azureEndpoint ||
+      azureApiKeyInput.value !== initialState.azureApiKey ||
+      azureDeploymentInput.value !== initialState.azureDeployment ||
+      azureApiVersionInput.value !== initialState.azureApiVersion ||
+      getActiveJolliApiKeyValue() !== initialState.jolliApiKey ||
+      claudeEnabledInput.checked !== initialState.claudeEnabled ||
+      codexEnabledInput.checked !== initialState.codexEnabled ||
+      geminiEnabledInput.checked !== initialState.geminiEnabled ||
+      openCodeEnabledInput.checked !== initialState.openCodeEnabled ||
+      cursorEnabledInput.checked !== initialState.cursorEnabled ||
+      devinEnabledInput.checked !== initialState.devinEnabled ||
+      copilotEnabledInput.checked !== initialState.copilotEnabled ||
+      clineEnabledInput.checked !== initialState.clineEnabled ||
+      antigravityEnabledInput.checked !== initialState.antigravityEnabled ||
+      globalInstructionsInput.checked !== initialState.globalInstructions ||
+      localFolderInput.value !== initialState.localFolder ||
+      excludePatternsInput.value !== initialState.excludePatterns ||
+      compileExcludeFoldersInput.value !== initialState.compileExcludeFolders ||
+      dcoSignoffInput.checked !== initialState.dcoSignoff ||
+      (autoSyncEnabledInput && autoSyncEnabledInput.checked !== initialState.autoSyncEnabled) ||
+      (syncTranscriptsInput && syncTranscriptsInput.checked !== initialState.syncTranscripts) ||
+      (syncPollIntervalMinInput && syncPollIntervalMinInput.value !== initialState.syncPollIntervalMin) ||
+      (mcpPlatformToolsEnabledInput && mcpPlatformToolsEnabledInput.checked !== initialState.mcpPlatformToolsEnabled) ||
+      (summaryLanguageInput && summaryLanguageInput.value !== initialState.summaryLanguage) ||
+      (localAgentPathInput && localAgentPathInput.value !== initialState.localAgentPath) ||
+      (openUrlAllowedOriginsInput && openUrlAllowedOriginsInput.value !== initialState.openUrlAllowedOrigins) ||
+      (logLevelSelect && logLevelSelect.value !== initialState.logLevel) ||
+      (logLevelOverridesJsonInput && logLevelOverridesJsonInput.value !== initialState.logLevelOverridesJson)
+    );
+    updateApplyBtn();
+  }
+
+  function updateApplyBtn() {
+    // Gate on both "nothing to save" and "has client-side errors". The click
+    // handler also re-runs validateAll() and surfaces a saveFeedback message
+    // if a validation error slips through (e.g. programmatic value change),
+    // so the user gets explicit feedback rather than a swallowed click.
+    applyBtn.disabled = !isDirty || hasErrors;
+  }
+
+  function clearSaveFeedback() {
+    saveFeedback.classList.remove('visible');
+    saveFeedback.classList.remove('error');
+  }
+
+  // ── Event listeners ──
+  apiKeyInput.addEventListener('input', function() {
+    validateAll(); checkDirty(); clearSaveFeedback();
+    updateAnthropicWarning();
+  });
+  // Keep the two Jolli API key inputs mirrored: editing one updates the other
+  // silently so dirty tracking and validation behave identically regardless of
+  // which card the user opened. The silent update intentionally skips
+  // checkDirty/clearSaveFeedback to avoid double-counting the same edit.
+  jolliApiKeyInput.addEventListener('input', function() {
+    if (jolliApiKeyNoKeyInput.value !== jolliApiKeyInput.value) {
+      jolliApiKeyNoKeyInput.value = jolliApiKeyInput.value;
+    }
+    validateAll(); checkDirty(); clearSaveFeedback();
+  });
+  jolliApiKeyNoKeyInput.addEventListener('input', function() {
+    if (jolliApiKeyInput.value !== jolliApiKeyNoKeyInput.value) {
+      jolliApiKeyInput.value = jolliApiKeyNoKeyInput.value;
+    }
+    validateAll(); checkDirty(); clearSaveFeedback();
+  });
+  [maxTokensInput, excludePatternsInput, compileExcludeFoldersInput, azureEndpointInput, azureApiKeyInput, azureDeploymentInput, azureApiVersionInput, summaryLanguageInput, localAgentPathInput, openUrlAllowedOriginsInput, logLevelOverridesJsonInput].forEach(function(input) {
+    input.addEventListener('input', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
+  });
+  // The Memory Bank folder input shares the same dirty/feedback handling as
+  // the other text fields. Additionally, editing the path makes any prior
+  // "Rebuild complete: ..." banner stale (the message echoes a path that no
+  // longer matches the form value), so clear it on input — same UX rule
+  // saveFeedback follows when a field is edited after a previous save.
+  localFolderInput.addEventListener('input', function() {
+    checkDirty();
+    clearSaveFeedback();
+    rebuildKbStatus.textContent = '';
+  });
+  modelSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
+  if (logLevelSelect) {
+    logLevelSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
+  }
+  localAgentToolSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
+  aiProviderSelect.addEventListener('change', function() {
+    checkDirty(); clearSaveFeedback(); syncProviderCard();
+  });
+  [claudeEnabledInput, codexEnabledInput, geminiEnabledInput, openCodeEnabledInput, cursorEnabledInput, copilotEnabledInput, clineEnabledInput, devinEnabledInput, antigravityEnabledInput, globalInstructionsInput].forEach(function(input) {
+    input.addEventListener('change', function() { validateAll(); checkDirty(); clearSaveFeedback(); });
+  });
+  dcoSignoffInput.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
+  if (mcpPlatformToolsEnabledInput) {
+    mcpPlatformToolsEnabledInput.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
+  }
+
+  // ── Apply Changes ──
+  // Returns true if the apply message was posted, false if a validation error
+  // blocked the post. The Migrate-after-Apply chain uses the return value to
+  // decide whether to clear pendingMigrateAfterApply on the spot.
+  function submitApplySettings() {
+    // Final client-side pass so inline errors stay in sync even if a field was
+    // changed programmatically or before any input event had a chance to fire.
+    validateAll();
+    if (hasErrors) {
+      saveFeedback.textContent = 'Please fix the highlighted fields before saving';
+      saveFeedback.classList.add('error');
+      saveFeedback.classList.add('visible');
+      return false;
+    }
+    var maxVal = maxTokensInput.value.trim();
+    vscode.postMessage({
+      command: 'applySettings',
+      settings: {
+        apiKey: apiKeyInput.value.trim(),
+        model: modelSelect.value,
+        maxTokens: maxVal.length > 0 ? Number(maxVal) : null,
+        aiProvider: aiProviderSelect.value,
+        localAgentTool: localAgentToolSelect.value,
+        azureEndpoint: azureEndpointInput.value.trim(),
+        azureApiKey: azureApiKeyInput.value.trim(),
+        azureDeployment: azureDeploymentInput.value.trim(),
+        azureApiVersion: azureApiVersionInput.value.trim(),
+        jolliApiKey: getActiveJolliApiKeyValue().trim(),
+        claudeEnabled: claudeEnabledInput.checked,
+        codexEnabled: codexEnabledInput.checked,
+        geminiEnabled: geminiEnabledInput.checked,
+        openCodeEnabled: openCodeEnabledInput.checked,
+        cursorEnabled: cursorEnabledInput.checked,
+        devinEnabled: devinEnabledInput.checked,
+        copilotEnabled: copilotEnabledInput.checked,
+        clineEnabled: clineEnabledInput.checked,
+        antigravityEnabled: antigravityEnabledInput.checked,
+        globalInstructions: globalInstructionsInput.checked,
+        localFolder: localFolderInput.value.trim(),
+        excludePatterns: excludePatternsInput.value,
+        compileExcludeFolders: compileExcludeFoldersInput.value,
+        dcoSignoff: dcoSignoffInput.checked,
+        autoSyncEnabled: autoSyncEnabledInput ? autoSyncEnabledInput.checked : false,
+        syncTranscripts: syncTranscriptsInput ? syncTranscriptsInput.checked : false,
+        mcpPlatformToolsEnabled: mcpPlatformToolsEnabledInput ? mcpPlatformToolsEnabledInput.checked : false,
+        summaryLanguage: summaryLanguageInput ? summaryLanguageInput.value.trim() : '',
+        localAgentPath: localAgentPathInput ? localAgentPathInput.value.trim() : '',
+        openUrlAllowedOrigins: openUrlAllowedOriginsInput ? openUrlAllowedOriginsInput.value : '',
+        logLevel: logLevelSelect ? logLevelSelect.value : '',
+        logLevelOverridesJson: logLevelOverridesJsonInput ? logLevelOverridesJsonInput.value.trim() : '',
+        // Parse minutes → seconds and clamp on the way out so the host gets a
+        // value it can write straight into config.json. The number input's
+        // min=90 attribute handles most user mistakes; we clamp defensively
+        // for blank / non-numeric edge cases.
+        syncPollIntervalSec: (function () {
+          if (!syncPollIntervalMinInput) return null;
+          const raw = syncPollIntervalMinInput.value.trim();
+          if (raw.length === 0) return null;
+          const n = Number(raw);
+          if (!Number.isFinite(n) || !Number.isInteger(n)) return null;
+          const clampedMin = Math.max(90, Math.min(1440, n));
+          return clampedMin * 60;
+        })(),
+      },
+      maskedApiKey: maskedApiKey,
+      maskedJolliApiKey: maskedJolliApiKey,
+    });
+    return true;
+  }
+
+  if (syncNowBtn) {
+    syncNowBtn.addEventListener('click', function() {
+      // Pressing "Sync now" implies the user wants the toggle state they're
+      // looking at — not whatever was last saved. If the form is dirty,
+      // chain Apply -> syncNow via pendingSyncAfterApply so we (a) wait
+      // for the host to actually persist before triggering the round and
+      // (b) abort cleanly if the save is rejected (settingsError). Same
+      // pattern as confirmDirtyMigrateResult -> migrate.
+      if (isDirty) {
+        pendingSyncAfterApply = true;
+        if (!submitApplySettings()) {
+          pendingSyncAfterApply = false;
+        }
+        return;
+      }
+      vscode.postMessage({ command: 'syncNow' });
+    });
+  }
+  // The interval input is meaningful only when the auto-sync toggle is on
+  // (plan §0.7). We don't hide it (avoids layout shift) but disable it so the
+  // grayed-out state communicates "this number won't take effect right now".
+  function applyAutoIntervalEnabledState() {
+    if (!syncPollIntervalMinInput) return;
+    const on = !!(autoSyncEnabledInput && autoSyncEnabledInput.checked);
+    syncPollIntervalMinInput.disabled = !on;
+  }
+  if (autoSyncEnabledInput) {
+    autoSyncEnabledInput.addEventListener('change', function () {
+      applyAutoIntervalEnabledState();
+      checkDirty();
+    });
+  }
+  if (syncTranscriptsInput) {
+    syncTranscriptsInput.addEventListener('change', checkDirty);
+  }
+  if (syncPollIntervalMinInput) {
+    syncPollIntervalMinInput.addEventListener('input', checkDirty);
+    syncPollIntervalMinInput.addEventListener('change', checkDirty);
+  }
+  // Initial state: keep input disabled until we receive the first settings
+  // message (so the user can't twiddle a number that isn't loaded yet).
+  applyAutoIntervalEnabledState();
+
+  applyBtn.addEventListener('click', function() {
+    if (applyBtn.disabled) return;
+    submitApplySettings();
+  });
+
+  // ── Messages from extension host ──
+  function applyAuthState(msg) {
+    signedIn = !!msg.signedIn;
+    hasJolliKey = !!msg.hasJolliKey;
+    if (jolliSiteLabel && typeof msg.jolliSiteLabel === 'string') {
+      jolliSiteLabel.textContent = msg.jolliSiteLabel;
+    }
+    // Sign-in/sign-out flips aiProvider on disk; mirror that into the open
+    // form so the next Apply doesn't clobber disk with a stale dropdown
+    // value. Re-baseline initialState.aiProvider and recompute dirty so the
+    // user's other unsaved edits keep their dirty bit, but this externally-
+    // changed field doesn't show as a phantom user edit.
+    if ((msg.aiProvider === 'jolli' || msg.aiProvider === 'anthropic' || msg.aiProvider === 'local-agent' || msg.aiProvider === 'azure-foundry')
+        && aiProviderSelect.value !== msg.aiProvider) {
+      aiProviderSelect.value = msg.aiProvider;
+      initialState.aiProvider = msg.aiProvider;
+      checkDirty();
+    }
+    syncProviderCard();
+    syncSyncCard();
+  }
+
+  window.addEventListener('message', function(event) {
+    var msg = event.data;
+    switch (msg.command) {
+      case 'settingsLoaded':
+        apiKeyInput.value = msg.maskedApiKey;
+        modelSelect.value = msg.settings.model || 'sonnet';
+        maxTokensInput.value = msg.settings.maxTokens != null ? String(msg.settings.maxTokens) : '';
+        aiProviderSelect.value = msg.settings.aiProvider || 'anthropic';
+        localAgentToolSelect.value = msg.settings.localAgentTool || 'claude-code';
+        azureEndpointInput.value = msg.settings.azureEndpoint || '';
+        azureApiKeyInput.value = msg.settings.azureApiKey || '';
+        azureDeploymentInput.value = msg.settings.azureDeployment || '';
+        azureApiVersionInput.value = msg.settings.azureApiVersion || '';
+        jolliApiKeyInput.value = msg.maskedJolliApiKey;
+        jolliApiKeyNoKeyInput.value = msg.maskedJolliApiKey;
+        claudeEnabledInput.checked = msg.settings.claudeEnabled;
+        codexEnabledInput.checked = msg.settings.codexEnabled;
+        geminiEnabledInput.checked = msg.settings.geminiEnabled;
+        openCodeEnabledInput.checked = msg.settings.openCodeEnabled;
+        cursorEnabledInput.checked = msg.settings.cursorEnabled;
+        devinEnabledInput.checked = msg.settings.devinEnabled;
+        copilotEnabledInput.checked = msg.settings.copilotEnabled;
+        clineEnabledInput.checked = msg.settings.clineEnabled;
+        antigravityEnabledInput.checked = msg.settings.antigravityEnabled;
+        globalInstructionsInput.checked = !!msg.settings.globalInstructions;
+        localFolderInput.value = msg.settings.localFolder || '';
+        excludePatternsInput.value = msg.settings.excludePatterns;
+        compileExcludeFoldersInput.value = msg.settings.compileExcludeFolders;
+        dcoSignoffInput.checked = !!msg.settings.dcoSignoff;
+        if (mcpPlatformToolsEnabledInput) mcpPlatformToolsEnabledInput.checked = !!msg.settings.mcpPlatformToolsEnabled;
+        if (summaryLanguageInput) summaryLanguageInput.value = msg.settings.summaryLanguage || '';
+        if (localAgentPathInput) localAgentPathInput.value = msg.settings.localAgentPath || '';
+        if (openUrlAllowedOriginsInput) openUrlAllowedOriginsInput.value = msg.settings.openUrlAllowedOrigins || '';
+        if (logLevelSelect) logLevelSelect.value = msg.settings.logLevel || '';
+        if (logLevelOverridesJsonInput) logLevelOverridesJsonInput.value = msg.settings.logLevelOverridesJson || '';
+        if (autoSyncEnabledInput) autoSyncEnabledInput.checked = !!msg.settings.autoSyncEnabled;
+        if (syncTranscriptsInput) syncTranscriptsInput.checked = !!msg.settings.syncTranscripts;
+        if (syncPollIntervalMinInput) {
+          // Host stores seconds; UI shows minutes. Empty → leave blank so the
+          // input placeholder ('90') signals the default without forcing a
+          // dirty form on every reload.
+          const sec = msg.settings.syncPollIntervalSec;
+          syncPollIntervalMinInput.value = typeof sec === 'number' && sec > 0 ? String(Math.round(sec / 60)) : '';
+        }
+        // Sync the interval input's enabled state with the auto toggle after
+        // loading settings (so a fresh load with auto=off lands disabled).
+        applyAutoIntervalEnabledState();
+        maskedApiKey = msg.maskedApiKey;
+        maskedJolliApiKey = msg.maskedJolliApiKey;
+        // Clear all validation errors on fresh load
+        document.querySelectorAll('.error').forEach(function(el) { el.classList.remove('error'); });
+        document.querySelectorAll('.error-message').forEach(function(el) { el.textContent = ''; });
+        hasErrors = false;
+        applyAuthState(msg);
+        updateAnthropicWarning();
+        // The count arrives separately via 'missingSummaryCountLoaded' (computed
+        // off the settings-load critical path). Reset to the pending state here,
+        // and keep the button disabled until the count lands so it can't be
+        // clicked on an unknown count.
+        if (missingSummariesCount) missingSummariesCount.textContent = 'Checking…';
+        if (generateSummariesBtn) generateSummariesBtn.disabled = true;
+        captureInitialState();
+        break;
+      case 'missingSummaryCountLoaded': {
+        const n = msg.missingSummaryCount;
+        const where = msg.repoName ? ' in ' + msg.repoName : ' in this repository';
+        if (missingSummariesCount) {
+          missingSummariesCount.textContent = typeof n === 'number'
+            ? (n === 0
+                ? 'All your commits' + where + ' already have summaries.'
+                : n + ' of your commits' + where + ' still need summaries.')
+            : '';
+        }
+        if (generateSummariesBtn) generateSummariesBtn.disabled = n === 0;
+        break;
+      }
+      case 'authStateChanged':
+        // Pushed after sign-in / sign-out so the cards re-render without
+        // requiring a full settings reload. Mirror IntelliJ's auth listener.
+        applyAuthState(msg);
+        break;
+      case 'setLocalFolder':
+        localFolderInput.value = msg.path || '';
+        checkDirty();
+        break;
+      case 'rebuildKnowledgeBaseDone':
+        rebuildKbBtn.disabled = false;
+        rebuildKbStatus.textContent = msg.success
+          ? 'Rebuild complete: ' + (msg.message || '')
+          : 'Rebuild failed: ' + (msg.message || 'unknown error');
+        break;
+      case 'generateMissingSummariesDone':
+        if (generateSummariesBtn) generateSummariesBtn.disabled = false;
+        if (generateSummariesStatus) {
+          generateSummariesStatus.textContent = msg.success
+            ? 'Done: ' + (msg.message || '')
+            : 'Failed: ' + (msg.message || 'unknown error');
+        }
+        break;
+      case 'confirmDirtyMigrateResult':
+        if (!msg.proceed) {
+          // User cancelled — leave the form exactly as it was.
+          break;
+        }
+        // User chose "Apply Changes & Migrate". Try to submit the apply; if
+        // client-side validation blocks it, the chain is aborted (the same
+        // saveFeedback banner the regular Apply path would show is already up).
+        rebuildKbStatus.textContent = 'Saving settings…';
+        pendingMigrateAfterApply = true;
+        if (!submitApplySettings()) {
+          pendingMigrateAfterApply = false;
+          rebuildKbStatus.textContent = '';
+        }
+        break;
+      case 'settingsSaved':
+        saveFeedback.textContent = 'Settings saved';
+        saveFeedback.classList.remove('error');
+        saveFeedback.classList.add('visible');
+        setTimeout(function() { saveFeedback.classList.remove('visible'); }, 2000);
+        captureInitialState();
+        if (pendingMigrateAfterApply) {
+          pendingMigrateAfterApply = false;
+          startRebuild();
+        }
+        if (pendingSyncAfterApply) {
+          pendingSyncAfterApply = false;
+          vscode.postMessage({ command: 'syncNow' });
+        }
+        break;
+      case 'settingsError':
+        // Persistent red banner — stays until the user edits a field (handled
+        // by the input listeners above, which clear it via clearSaveFeedback).
+        saveFeedback.textContent = msg.message;
+        saveFeedback.classList.add('error');
+        saveFeedback.classList.add('visible');
+        if (pendingMigrateAfterApply) {
+          // Host rejected the save (e.g. server-side jolli key validation).
+          // Abort the chain so we don't migrate against unsaved state.
+          pendingMigrateAfterApply = false;
+          rebuildKbStatus.textContent = '';
+        }
+        if (pendingSyncAfterApply) {
+          // Same reason: don't run a sync round against config the host just
+          // refused to persist.
+          pendingSyncAfterApply = false;
+        }
+        break;
+    }
+  });
+
+  // ── Initial load ──
+  vscode.postMessage({ command: 'loadSettings' });
+  `;
+}

@@ -5,8 +5,16 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getJolliMemoryDir } from "../Logger.js";
 import { INGEST_CODES } from "./IngestErrors.js";
 import { appendCredentialMissingRun, appendIngestRun, type IngestRunRecord, readIngestRuns } from "./IngestRunStore.js";
-import { initTelemetry, shutdownTelemetry } from "./Telemetry.js";
+import { initTelemetry, shutdownTelemetry, TELEMETRY_HARD_DISABLED } from "./Telemetry.js";
 import { readTelemetryEvents } from "./TelemetryBuffer.js";
+
+/**
+ * GoldJolli fork: `TELEMETRY_HARD_DISABLED` (Telemetry.ts) makes the
+ * `track()`/`trackError()` calls inside IngestRunStore unconditional no-ops,
+ * so the upstream tests below that assert an actual buffered event are
+ * skipped rather than deleted — see the matching note in Telemetry.test.ts.
+ */
+const itUnlessHardDisabled = TELEMETRY_HARD_DISABLED ? it.skip : it;
 
 let cwd: string;
 const rec = (over: Partial<IngestRunRecord> = {}): IngestRunRecord => ({
@@ -94,7 +102,7 @@ describe("IngestRunStore telemetry — error_occurred gating (JOLLI-1962)", () =
 
 	const eventsOfType = async (name: string) => (await readTelemetryEvents(cwd)).filter((e) => e.eventName === name);
 
-	it("does NOT raise error_occurred for success or benign/expected outcomes", async () => {
+	itUnlessHardDisabled("does NOT raise error_occurred for success or benign/expected outcomes", async () => {
 		const benign = [
 			INGEST_CODES.OK,
 			INGEST_CODES.NO_PENDING,
@@ -108,7 +116,7 @@ describe("IngestRunStore telemetry — error_occurred gating (JOLLI-1962)", () =
 		expect(await eventsOfType("error_occurred")).toEqual([]);
 	});
 
-	it("raises one error_occurred(where=ingest) per genuine failure outcome", async () => {
+	itUnlessHardDisabled("raises one error_occurred(where=ingest) per genuine failure outcome", async () => {
 		const failures = [
 			INGEST_CODES.ROUTE_FAILED,
 			INGEST_CODES.RECONCILE_TRUNCATED,
@@ -123,10 +131,18 @@ describe("IngestRunStore telemetry — error_occurred gating (JOLLI-1962)", () =
 		expect(errs.every((e) => (e.properties as { where?: string }).where === "ingest")).toBe(true);
 	});
 
-	it("flags idle (ingested=0) vs real ingests on ingest_completed (JOLLI-1964)", async () => {
+	itUnlessHardDisabled("flags idle (ingested=0) vs real ingests on ingest_completed (JOLLI-1964)", async () => {
 		await appendIngestRun(cwd, rec({ outcome: INGEST_CODES.NO_PENDING, ingested: 0 }));
 		await appendIngestRun(cwd, rec({ outcome: INGEST_CODES.OK, ingested: 3 }));
 		const completed = await eventsOfType("ingest_completed");
 		expect(completed.map((e) => (e.properties as { idle?: boolean }).idle)).toEqual([true, false]);
+	});
+
+	it("still records the ingest run itself, but emits no telemetry, under TELEMETRY_HARD_DISABLED", async () => {
+		expect(TELEMETRY_HARD_DISABLED).toBe(true);
+		await appendIngestRun(cwd, rec({ outcome: INGEST_CODES.ROUTE_FAILED }));
+		expect(await readIngestRuns(cwd)).toHaveLength(1);
+		expect(await eventsOfType("ingest_completed")).toEqual([]);
+		expect(await eventsOfType("error_occurred")).toEqual([]);
 	});
 });

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { initTelemetry, shutdownTelemetry } from "./Telemetry.js";
+import { initTelemetry, shutdownTelemetry, TELEMETRY_HARD_DISABLED } from "./Telemetry.js";
 import { readTelemetryEvents } from "./TelemetryBuffer.js";
 import {
 	commandPath,
@@ -13,6 +13,15 @@ import {
 	shouldSkipExitFlush,
 	trackCommandFailureIfPending,
 } from "./TelemetryCommandHook.js";
+
+/**
+ * GoldJolli fork: this module is no longer wired into Api.ts/Cli.ts (see
+ * docs/local-fork-maintenance.md), and the underlying `track()` calls it
+ * makes are unconditional no-ops under `TELEMETRY_HARD_DISABLED` (see
+ * Telemetry.ts) regardless of wiring. The upstream tests below that assert
+ * an actual buffered `command_invoked` event are skipped rather than deleted.
+ */
+const itUnlessHardDisabled = TELEMETRY_HARD_DISABLED ? it.skip : it;
 
 let cwd: string;
 
@@ -49,7 +58,7 @@ describe("commandPath", () => {
 });
 
 describe("installCommandTelemetryHooks", () => {
-	it("emits command_invoked on a successful top-level command", async () => {
+	itUnlessHardDisabled("emits command_invoked on a successful top-level command", async () => {
 		const program = programWith(() => {});
 		await program.parseAsync(["node", "jolli", "recall"]);
 		const events = await readTelemetryEvents(cwd);
@@ -59,7 +68,7 @@ describe("installCommandTelemetryHooks", () => {
 		expect(typeof events[0].properties.duration_ms).toBe("number");
 	});
 
-	it("uses the full path for a nested command", async () => {
+	itUnlessHardDisabled("uses the full path for a nested command", async () => {
 		const program = programWith(() => {});
 		await program.parseAsync(["node", "jolli", "auth", "login"]);
 		const [event] = await readTelemetryEvents(cwd);
@@ -110,22 +119,25 @@ describe("installCommandTelemetryHooks", () => {
 		expect(await readTelemetryEvents(cwd)).toEqual([]);
 	});
 
-	it("trackCommandFailureIfPending records command_invoked{ok:false} after a thrown action (JOLLI-1960)", async () => {
-		const program = programWith(() => {
-			throw new Error("boom");
-		});
-		await expect(program.parseAsync(["node", "jolli", "recall"])).rejects.toThrow("boom");
-		// postAction was skipped, so nothing is buffered yet…
-		expect(await readTelemetryEvents(cwd)).toEqual([]);
-		// …until the CLI's top-level catch records the failure.
-		trackCommandFailureIfPending();
-		const [e] = await readTelemetryEvents(cwd);
-		expect(e.eventName).toBe("command_invoked");
-		expect(e.properties).toMatchObject({ command: "recall", ok: false });
-		expect(typeof e.properties.duration_ms).toBe("number");
-	});
+	itUnlessHardDisabled(
+		"trackCommandFailureIfPending records command_invoked{ok:false} after a thrown action (JOLLI-1960)",
+		async () => {
+			const program = programWith(() => {
+				throw new Error("boom");
+			});
+			await expect(program.parseAsync(["node", "jolli", "recall"])).rejects.toThrow("boom");
+			// postAction was skipped, so nothing is buffered yet…
+			expect(await readTelemetryEvents(cwd)).toEqual([]);
+			// …until the CLI's top-level catch records the failure.
+			trackCommandFailureIfPending();
+			const [e] = await readTelemetryEvents(cwd);
+			expect(e.eventName).toBe("command_invoked");
+			expect(e.properties).toMatchObject({ command: "recall", ok: false });
+			expect(typeof e.properties.duration_ms).toBe("number");
+		},
+	);
 
-	it("trackCommandFailureIfPending is a no-op after a successful command", async () => {
+	itUnlessHardDisabled("trackCommandFailureIfPending is a no-op after a successful command", async () => {
 		const program = programWith(() => {});
 		await program.parseAsync(["node", "jolli", "recall"]);
 		trackCommandFailureIfPending();
@@ -140,6 +152,13 @@ describe("installCommandTelemetryHooks", () => {
 		});
 		await expect(program.parseAsync(["node", "jolli", "mcp"])).rejects.toThrow("boom");
 		trackCommandFailureIfPending();
+		expect(await readTelemetryEvents(cwd)).toEqual([]);
+	});
+
+	it("emits nothing for a successful top-level command under TELEMETRY_HARD_DISABLED", async () => {
+		expect(TELEMETRY_HARD_DISABLED).toBe(true);
+		const program = programWith(() => {});
+		await program.parseAsync(["node", "jolli", "recall"]);
 		expect(await readTelemetryEvents(cwd)).toEqual([]);
 	});
 });

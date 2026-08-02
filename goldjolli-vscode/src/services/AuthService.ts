@@ -1,0 +1,458 @@
+/**
+ * AuthService
+ *
+ * Manages OAuth login/signup state for the Jolli Memory VSCode extension.
+ * Wraps core auth functions with VSCode-specific URI handling and context keys.
+ *
+ * Credentials are stored in ~/.jolli/jollimemory/config.json (shared with the CLI),
+ * NOT in VSCode SecretStorage — this keeps the CLI and extension in sync.
+ *
+ * Auth state is determined by the presence of `authToken` in config.
+ * Display info (site URL, tenant) is derived from the API key metadata.
+ */
+
+/// <reference path="../../../cli/src/Globals.d.ts" />
+
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import * as vscode from "vscode";
+import {
+	clearAuthCredentials,
+	getJolliUrl,
+	resolveSignInJolliUrl,
+	saveAuthCredentials,
+	shouldRequestFreshApiKey,
+} from "../../../cli/src/auth/AuthConfig.js";
+import { exchangeCliCode } from "../../../cli/src/auth/CliExchange.js";
+import { getDeviceLabel } from "../../../cli/src/auth/DeviceLabel.js";
+import { loadConfig } from "../../../cli/src/core/SessionTracker.js";
+import { track } from "../../../cli/src/core/Telemetry.js";
+import type { JolliMemoryConfig } from "../../../cli/src/Types.js";
+import { log } from "../util/Logger.js";
+import { EXTENSION_ID, resolveUriScheme } from "../util/UriSchemeResolver.js";
+
+/**
+ * Surface version sent on the login URL as `client_version`. Pairs with
+ * `client=vscode` so the server can gate sign-in on the same min-version
+ * policy applied to subsequent `x-jolli-client` HTTP requests. Build-time
+ * `__PKG_VERSION__` is the `vscode/package.json` version (the surface the
+ * user installed and would upgrade), not the inlined CLI package version,
+ * matching the convention in `core/LlmClient.ts`. Falls back to `"dev"`
+ * under tsx / tests.
+ */
+/* v8 ignore next -- compile-time ternary: always "dev" in tests, always __PKG_VERSION__ in build */
+const CLIENT_VERSION =
+	typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ : "dev";
+
+/** VSCode URI callback path for OAuth redirects */
+const AUTH_CALLBACK_PATH = "/auth-callback";
+
+/**
+ * How long an in-flight sign-in nonce stays valid when {@link vscode.env.openExternal}
+ * resolves `false`. That return value is ambiguous — it means the user picked
+ * either "Copy" or "Cancel" from VSCode's external-URI consent dialog, and the
+ * API doesn't distinguish them. The Copy path must keep the nonce because the
+ * user will paste the URL into a browser and complete sign-in normally; the
+ * Cancel path leaves a nonce we'd otherwise never reclaim. Picking a TTL
+ * shorter than the server-side `state` TTL (typically ~10 minutes) lets the
+ * Cancel-leftover age out before the server-issued state does.
+ */
+const PENDING_STATE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Result of handling an auth callback URI. Discriminated on `success` so the
+ * error branch is guaranteed to carry a message — prevents UIs from surfacing
+ * "...: undefined" when something goes wrong.
+ */
+export type AuthCallbackResult =
+	| { readonly success: true }
+	| { readonly success: false; readonly error: string };
+
+/**
+ * Manages OAuth login/signup flow and auth state.
+ *
+ * - `handleAuthCallback()` parses the `vscode://` URI from the browser redirect
+ * - `signOut()` clears credentials from config.json
+ * - `openSignInPage()` launches the browser to the Jolli login page
+ * - `isSignedIn()` / `refreshContextKey()` manage the `jollimemory.signedIn` context key
+ *
+ * All reads and writes go through the global `~/.jolli/jollimemory/config.json`
+ * via the `saveConfig` / `clearAuthCredentials` helpers, so there's no need to
+ * inject a config directory at construction time.
+ */
+export class AuthService {
+	/**
+	 * CSRF state nonce for the in-flight login attempt (RFC 6749 §10.12).
+	 * Set in {@link openSignInPage} before opening the browser; consumed and
+	 * cleared on the next {@link handleAuthCallback} so a captured state can't
+	 * be replayed against a future login. `null` between attempts.
+	 *
+	 * Lives in memory only — extension reload during a sign-in invalidates
+	 * the in-flight attempt by design (the user retries).
+	 */
+	private pendingState: string | null = null;
+
+	/**
+	 * Deferred-expiry timer for {@link pendingState}. Started only when
+	 * {@link vscode.env.openExternal} resolves `false` — VSCode's "Open
+	 * external URI?" consent dialog returns `false` for both "Copy" (URL
+	 * copied to clipboard, user pastes into browser, sign-in still
+	 * proceeds) and "Cancel" (user aborted). The API can't tell them
+	 * apart, so we keep the nonce alive for {@link PENDING_STATE_TTL_MS}
+	 * so the Copy path can complete, and let the Cancel path's leftover
+	 * nonce age out automatically.
+	 */
+	private pendingStateTimer: ReturnType<typeof setTimeout> | null = null;
+
+	/** Cancels any pending TTL expiry. Safe to call when no timer is set. */
+	private cancelPendingStateTimer(): void {
+		if (this.pendingStateTimer !== null) {
+			clearTimeout(this.pendingStateTimer);
+			this.pendingStateTimer = null;
+		}
+	}
+
+	/**
+	 * Handles the OAuth callback URI from the browser redirect.
+	 *
+	 * Two callback shapes are accepted, in priority order:
+	 *
+	 *   1. Code-exchange (preferred — issued by upgraded servers):
+	 *        vscode://jolli.jollimemory-vscode/auth-callback?code=<32-byte-hex>
+	 *      The `code` is single-use and TTL-bound; we POST it to
+	 *      `/api/auth/cli-exchange` to redeem the actual token + API key over a
+	 *      channel the browser never sees.
+	 *
+	 *   2. Legacy token-in-URL (fallback — issued by pre-code-exchange servers):
+	 *        vscode://jolli.jollimemory-vscode/auth-callback?token=<jwt>&jolli_api_key=<sk-jol-…>
+	 *      Server delivers credentials directly in query params. Less secure
+	 *      (token visible to URI handler chain), but required so users on the
+	 *      latest extension can still sign in to a server that hasn't shipped
+	 *      the code-exchange endpoint yet. Remove once all server tenants
+	 *      issue `?code=` callbacks.
+	 *
+	 *   3. Error: ?error=<code>
+	 */
+	async handleAuthCallback(uri: vscode.Uri): Promise<AuthCallbackResult> {
+		if (uri.path !== AUTH_CALLBACK_PATH) {
+			log.warn("AuthService", "Ignoring unknown URI path: %s", uri.path);
+			return { success: false, error: "Unknown callback path" };
+		}
+
+		// The callback has arrived — cancel any deferred-expiry timer started
+		// by openSignInPage()'s `!opened` branch. Single-consumption of
+		// pendingState happens a few lines down; the timer is purely a
+		// belt-and-suspenders for the "user cancelled the consent dialog"
+		// case where no callback ever arrives.
+		this.cancelPendingStateTimer();
+
+		const params = new URLSearchParams(uri.query);
+		const error = params.get("error");
+		if (error) {
+			const message = getErrorMessage(error);
+			log.error("AuthService", "Auth callback error: %s", message);
+			return { success: false, error: message };
+		}
+
+		// Prefer the code-exchange flow when the server offers it. The two
+		// shapes are mutually exclusive in practice (a given server emits one
+		// or the other), so this just selects the right path automatically.
+		const code = params.get("code");
+		const token = params.get("token");
+
+		// CSRF check (RFC 6749 §10.12). Only enforced on the code-exchange
+		// path; the legacy token-in-URL fallback predates state support and
+		// older servers don't echo state. Tightening it here would lock
+		// those users out of sign-in. The legacy gap closes when the fallback
+		// is removed.
+		//
+		// One-shot: clearing pendingState before validation prevents an
+		// attacker who rapidly fires two callbacks (one with the right
+		// state, one without) from getting two attempts at the same nonce.
+		const expectedState = this.pendingState;
+		this.pendingState = null;
+		if (code) {
+			const receivedState = params.get("state");
+			if (
+				!expectedState ||
+				!receivedState ||
+				!constantTimeStringEqual(receivedState, expectedState)
+			) {
+				log.error(
+					"AuthService",
+					"Auth callback state mismatch — rejecting (possible CSRF attempt)",
+				);
+				return {
+					success: false,
+					error: "Invalid sign-in callback (state mismatch). Please try again.",
+				};
+			}
+		}
+
+		// Captured once so both branches (and any later retry logic) agree on
+		// which origin the save records — calling `getJolliUrl()` again later
+		// would otherwise read a freshly-mutated `JOLLI_URL` env var.
+		// Wrapped because `getJolliUrl()` throws when `JOLLI_URL` was mutated
+		// to an off-allowlist value mid-flight; the AuthCallbackResult
+		// contract requires we surface that as a structured error instead of
+		// letting the promise reject.
+		//
+		// This is a deliberate RE-READ at callback time, NOT a reuse of the
+		// value openSignInPage opened the browser with. Re-validating here
+		// makes an off-allowlist `JOLLI_URL` mutation between launch and
+		// callback fail closed (the throw above). The CLI instead threads the
+		// open-time value (`AuthCommand.ts` -> `browserLogin`), so the two
+		// surfaces make opposite trade-offs: the residual edge where
+		// `JOLLI_URL` is switched between two *allowlisted* tenants mid-flight
+		// (near-nil — requires process-env write) is accepted here in exchange
+		// for the off-allowlist fail-closed guarantee. Don't "align" this to
+		// the CLI without also moving the off-allowlist guard + its tests.
+		let jolliUrl: string;
+		try {
+			jolliUrl = getJolliUrl();
+		} catch (err: unknown) {
+			const message = err instanceof Error ? err.message : String(err);
+			log.error("AuthService", "getJolliUrl rejected mid-callback: %s", message);
+			return { success: false, error: message };
+		}
+		let credentials: { token: string; jolliApiKey?: string; jolliUrl: string };
+		if (code) {
+			try {
+				const exchanged = await exchangeCliCode(jolliUrl, code);
+				credentials = {
+					token: exchanged.token,
+					// Persist the minted key's tenant (`meta.u`), not the sign-in
+					// origin — with no `JOLLI_URL` set the latter is the auth hub,
+					// which would fail `saveAuthCredentials`'s symmetry check and
+					// misdirect the routing fallback. See `resolveSignInJolliUrl`.
+					jolliUrl: resolveSignInJolliUrl(exchanged.jolliApiKey, jolliUrl),
+					...(exchanged.jolliApiKey
+						? { jolliApiKey: exchanged.jolliApiKey }
+						: {}),
+				};
+			} catch (err: unknown) {
+				const message = err instanceof Error ? err.message : String(err);
+				log.error("AuthService", "Failed to exchange code: %s", message);
+				return { success: false, error: message };
+			}
+		} else if (token) {
+			// Legacy fallback. Logged at warn level so we can track residual
+			// usage and decide when it's safe to drop this branch.
+			log.warn(
+				"AuthService",
+				"Using legacy token-in-URL callback — server has not been upgraded to the code-exchange flow",
+			);
+			const legacyApiKey = params.get("jolli_api_key");
+			credentials = {
+				token,
+				jolliUrl: resolveSignInJolliUrl(legacyApiKey ?? undefined, jolliUrl),
+				...(legacyApiKey ? { jolliApiKey: legacyApiKey } : {}),
+			};
+		} else {
+			log.error("AuthService", "Auth callback missing code and token");
+			return {
+				success: false,
+				error: "No authorization code or token received",
+			};
+		}
+
+		try {
+			// Single atomic write — avoids leaving the config in a half-written state
+			// (token saved, API key dropped) if the second write were to fail.
+			await saveAuthCredentials(credentials);
+		} catch (err: unknown) {
+			const message = err instanceof Error ? err.message : String(err);
+			log.error("AuthService", "Failed to save credentials: %s", message);
+			return {
+				success: false,
+				error: `Failed to save credentials: ${message}`,
+			};
+		}
+
+		// Updating the context key is best-effort — a failure here shouldn't
+		// invalidate a successful save, so it lives outside the try/catch above.
+		try {
+			await vscode.commands.executeCommand(
+				"setContext",
+				"jollimemory.signedIn",
+				true,
+			);
+		} catch (err: unknown) {
+			log.warn("AuthService", "Failed to update signedIn context key: %s", err);
+		}
+		// JOLLI-1904 (funnel): the conversion event. `api_key_minted` mirrors
+		// IntelliJ — whether this sign-in provisioned a jolliApiKey. surface=vscode
+		// is auto-injected. No-op if telemetry is off.
+		track("signin_completed", { api_key_minted: credentials.jolliApiKey != null });
+		log.info("AuthService", "Sign-in successful");
+		return { success: true };
+	}
+
+	/** Clears auth credentials from config.json and resets the context key. */
+	async signOut(): Promise<void> {
+		// Drop any in-flight sign-in alongside the persisted credentials so a
+		// late callback from a prior attempt can't land after signOut.
+		this.cancelPendingStateTimer();
+		this.pendingState = null;
+		// Writes `{ authToken: undefined, jolliApiKey: undefined }` to the global
+		// config — JSON.stringify omits undefined fields so both are removed.
+		await clearAuthCredentials();
+		await vscode.commands.executeCommand(
+			"setContext",
+			"jollimemory.signedIn",
+			false,
+		);
+		track("signed_out");
+		log.info("AuthService", "Signed out");
+	}
+
+	/** Opens the browser to the Jolli login page with a VSCode callback URI. */
+	async openSignInPage(): Promise<void> {
+		// JOLLI-1904 (funnel): sign-in initiated. `trigger` mirrors IntelliJ's
+		// surface-tagged value; surface=vscode is auto-injected. No-op if off.
+		track("signin_started", { trigger: "vscode" });
+		// Derive the callback scheme from the host IDE. `vscode.env.uriScheme`
+		// is unreliable here — most forks inherit upstream's "vscode" default
+		// for that API even though they register their own scheme at the OS
+		// level. `appName` is consistently rebranded (forks surface it in window
+		// titles and About dialogs), so it's the stable signal — see
+		// resolveUriScheme() at the bottom of this file.
+		const callbackUri = `${resolveUriScheme()}://${EXTENSION_ID}${AUTH_CALLBACK_PATH}`;
+		// 256-bit CSRF nonce per RFC 6749 §10.12. Sent on the login URL and
+		// validated on the matching handleAuthCallback().
+		const state = randomBytes(32).toString("hex");
+		// Resolve the target URL up front so the `generate_api_key` decision
+		// below sees the same value the rest of the flow signs into. Wrapped
+		// because `getJolliUrl()` throws when `JOLLI_URL` points off the
+		// allowlist — surface that as a friendly error dialog instead of an
+		// unhandled command exception.
+		let jolliUrl: string;
+		try {
+			jolliUrl = getJolliUrl();
+		} catch (err: unknown) {
+			const message = err instanceof Error ? err.message : String(err);
+			log.error("AuthService", "getJolliUrl rejected: %s", message);
+			vscode.window.showErrorMessage(
+				`Cannot sign in: ${message} Unset JOLLI_URL (or set it to a trusted Jolli host) and retry.`,
+			);
+			return;
+		}
+		// Ask the server for a fresh Jolli API key when (a) no key is on disk,
+		// or (b) the on-disk key targets a different tenant than `jolliUrl`.
+		// (b) makes cross-tenant switch complete in a single sign-in instead
+		// of two; without it the callback returns no new key, the stale-key
+		// clear in `saveAuthCredentials` empties the slot, and the user has
+		// to sign in again to actually provision. Same-tenant re-auth still
+		// preserves an existing key (manually configured or otherwise).
+		const { jolliApiKey } = await loadConfig();
+		const wantsFreshKey = shouldRequestFreshApiKey(jolliApiKey, jolliUrl);
+		const generateKeyParam = wantsFreshKey ? "&generate_api_key=true" : "";
+		// `device_name` scopes the server's per-user idempotency key so signing
+		// in from a second machine doesn't invalidate the first machine's
+		// auto-generated API key. Only meaningful when we're asking the server
+		// to mint a new key — paired with generate_api_key.
+		const deviceLabel = wantsFreshKey ? getDeviceLabel() : undefined;
+		const deviceLabelParam = deviceLabel
+			? `&device_name=${encodeURIComponent(deviceLabel)}`
+			: "";
+		// Param order matches CLI / IntelliJ:
+		// cli_callback → state → client → client_version → generate_api_key → device_name.
+		// A pinned ordering keeps the three surfaces visually comparable in
+		// captures / logs and protects against silent drift on isolated edits.
+		const loginUrl = `${jolliUrl}/login?cli_callback=${encodeURIComponent(callbackUri)}&state=${state}&client=vscode&client_version=${encodeURIComponent(CLIENT_VERSION)}${generateKeyParam}${deviceLabelParam}`;
+		// Commit pendingState only after the URL builds — otherwise a thrown
+		// getJolliUrl() would leave behind a state that pairs with no
+		// outgoing nonce. Clear any prior deferred-expiry timer so a rapid
+		// second sign-in attempt doesn't wipe its own freshly-committed
+		// state when the previous attempt's TTL fires.
+		this.cancelPendingStateTimer();
+		this.pendingState = state;
+		log.info("AuthService", "Opening browser for sign-in");
+		try {
+			const opened = await vscode.env.openExternal(vscode.Uri.parse(loginUrl));
+			if (!opened) {
+				// `openExternal` resolves `false` for BOTH "Copy" and "Cancel" in
+				// VSCode's external-URI consent dialog — the API doesn't
+				// distinguish them. The Copy flow needs pendingState preserved
+				// so the user can paste the URL into a browser and complete
+				// sign-in normally; the Cancel flow leaves a nonce we'd
+				// otherwise never reclaim. Defer expiry by PENDING_STATE_TTL_MS
+				// so Copy works and Cancel leftovers age out automatically.
+				log.info(
+					"AuthService",
+					"openExternal returned false (user picked Copy or Cancel); preserving nonce for %d ms",
+					PENDING_STATE_TTL_MS,
+				);
+				this.pendingStateTimer = setTimeout(() => {
+					this.pendingState = null;
+					this.pendingStateTimer = null;
+				}, PENDING_STATE_TTL_MS);
+				// Don't block process exit on the timer — the extension host
+				// shouldn't be kept alive by an idle sign-in TTL.
+				this.pendingStateTimer.unref?.();
+			}
+		} catch (err: unknown) {
+			// A genuine launch failure (no available URI handler, browser
+			// process unavailable, etc.) — no callback can ever arrive, so
+			// drop the nonce immediately and surface the error.
+			this.cancelPendingStateTimer();
+			this.pendingState = null;
+			const message = err instanceof Error ? err.message : String(err);
+			log.error("AuthService", "openExternal failed: %s", message);
+			vscode.window.showErrorMessage(
+				`Couldn't launch the browser for sign-in: ${message}`,
+			);
+		}
+	}
+
+	/** Returns true if the user is signed in via OAuth (authToken present in config). */
+	isSignedIn(config: JolliMemoryConfig): boolean {
+		return !!config.authToken;
+	}
+
+	/** Updates the `jollimemory.signedIn` context key based on config state. */
+	refreshContextKey(config: JolliMemoryConfig): void {
+		vscode.commands.executeCommand(
+			"setContext",
+			"jollimemory.signedIn",
+			this.isSignedIn(config),
+		);
+	}
+}
+
+/**
+ * Constant-time string equality. Mirrors Login.ts. The 256-bit nonce makes
+ * timing leaks infeasible in practice, but `timingSafeEqual` costs nothing
+ * extra and keeps the comparison correct-by-construction.
+ *
+ * Length is compared on the encoded byte buffers, not the JS strings:
+ * `String.prototype.length` counts UTF-16 code units while `Buffer.from`
+ * defaults to UTF-8, so an attacker-supplied non-ASCII state of matching
+ * char-length would otherwise crash `timingSafeEqual` with RangeError.
+ */
+function constantTimeStringEqual(a: string, b: string): boolean {
+	const ba = Buffer.from(a);
+	const bb = Buffer.from(b);
+	if (ba.length !== bb.length) return false;
+	return timingSafeEqual(ba, bb);
+}
+
+/** Maps server-returned error codes to user-friendly messages. Mirrors Login.ts. */
+function getErrorMessage(errorCode: string): string {
+	const errorMessages: Record<string, string> = {
+		oauth_failed: "OAuth authentication failed. Please try again.",
+		session_missing: "Session expired or missing. Please try again.",
+		invalid_provider: "Invalid authentication provider.",
+		auth_fetch_failed:
+			"Failed to fetch user information from the authentication provider.",
+		no_verified_emails: "No verified email addresses found on your account.",
+		server_error:
+			"An unexpected server error occurred. Please try again later.",
+		failed_to_get_token:
+			"We couldn't retrieve your credentials. Please try signing in again.",
+		user_denied:
+			"Sign-in was cancelled. You can try again from the side panel.",
+		invalid_callback:
+			"The sign-in callback was rejected by the server. Please try again.",
+	};
+	return errorMessages[errorCode] ?? `Authentication error: ${errorCode}`;
+}

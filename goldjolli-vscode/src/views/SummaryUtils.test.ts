@@ -1,0 +1,936 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const {
+	mockCollectDisplayTopics,
+	mockCollectSourceNodes,
+	mockComputeDurationDays,
+} = vi.hoisted(() => ({
+	mockCollectDisplayTopics: vi.fn(),
+	mockCollectSourceNodes: vi.fn(),
+	mockComputeDurationDays: vi.fn(),
+}));
+
+vi.mock("../../../cli/src/core/SummaryTree.js", () => ({
+	collectDisplayTopics: mockCollectDisplayTopics,
+	collectSourceNodes: mockCollectSourceNodes,
+	computeDurationDays: mockComputeDurationDays,
+}));
+
+import type { CommitSummary, PlanReference } from "../../../cli/src/Types.js";
+import type { TopicWithDate } from "./SummaryUtils.js";
+import {
+	buildBranchRelativePath,
+	buildNotePushTitle,
+	buildPanelTitle,
+	buildPlanPushTitle,
+	buildPushTitle,
+	collectAllPlans,
+	collectLlmSources,
+	collectSortedTopics,
+	escAttr,
+	escHtml,
+	escMdLinkText,
+	escMdUrl,
+	formatActiveProviderLabel,
+	formatDate,
+	formatFullDate,
+	formatProviderLabel,
+	formatSonnetCostEstimate,
+	formatTokensCompact,
+	padIndex,
+	renderCalloutText,
+	sortTopics,
+	timeAgo,
+} from "./SummaryUtils.js";
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Builds a mock CommitSummary with sensible defaults. Override any field as needed. */
+function makeSummary(overrides: Partial<CommitSummary> = {}): CommitSummary {
+	return {
+		version: 1,
+		commitHash: "abc1234def5678",
+		commitMessage: "Fix some bug",
+		commitAuthor: "Alice",
+		commitDate: "2026-03-15T10:30:00.000Z",
+		branch: "feature/proj-100-my-feature",
+		generatedAt: "2026-03-15T10:31:00.000Z",
+		...overrides,
+	};
+}
+
+/** Builds a mock TopicWithDate. */
+function makeTopic(overrides: Partial<TopicWithDate> = {}): TopicWithDate {
+	return {
+		title: "Test topic",
+		trigger: "User asked",
+		response: "Did the thing",
+		decisions: "Chose approach A",
+		importance: "major",
+		...overrides,
+	};
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+describe("SummaryUtils", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	// ── escHtml ──────────────────────────────────────────────────────────────
+
+	describe("escHtml", () => {
+		it("escapes ampersand, angle brackets, and double quotes", () => {
+			expect(escHtml('&<>"')).toBe("&amp;&lt;&gt;&quot;");
+		});
+
+		it("returns unmodified string when no special characters", () => {
+			expect(escHtml("hello world")).toBe("hello world");
+		});
+
+		it("handles multiple occurrences", () => {
+			expect(escHtml("a & b & c")).toBe("a &amp; b &amp; c");
+		});
+
+		it("handles empty string", () => {
+			expect(escHtml("")).toBe("");
+		});
+	});
+
+	// ── escAttr ──────────────────────────────────────────────────────────────
+
+	describe("escAttr", () => {
+		it("escapes ampersand, double quote, single quote, less-than, and greater-than", () => {
+			expect(escAttr("&\"'<>")).toBe("&amp;&quot;&#39;&lt;&gt;");
+		});
+
+		it("returns unmodified string when no special characters", () => {
+			expect(escAttr("plain text")).toBe("plain text");
+		});
+
+		it("handles empty string", () => {
+			expect(escAttr("")).toBe("");
+		});
+	});
+
+	// ── escMdLinkText ──────────────────────────────────────────────────────────
+
+	describe("escMdLinkText", () => {
+		it("backslash-escapes backslash, open bracket, and close bracket", () => {
+			expect(escMdLinkText("a\\b[c]d")).toBe("a\\\\b\\[c\\]d");
+		});
+
+		it("prevents link breakout via crafted bracket title", () => {
+			// A title like `x](http://evil)` must not close the link early.
+			expect(escMdLinkText("x](http://evil)")).toBe("x\\](http://evil)");
+		});
+
+		it("folds newlines and carriage returns into a single space", () => {
+			expect(escMdLinkText("line one\nline two")).toBe("line one line two");
+			expect(escMdLinkText("a\r\n\r\nb")).toBe("a b");
+		});
+
+		it("returns plain text unchanged", () => {
+			expect(escMdLinkText("PROJ-100 fix bug")).toBe("PROJ-100 fix bug");
+		});
+
+		it("handles empty string", () => {
+			expect(escMdLinkText("")).toBe("");
+		});
+	});
+
+	// ── escMdUrl ─────────────────────────────────────────────────────────────
+
+	describe("escMdUrl", () => {
+		it("percent-encodes parentheses explicitly", () => {
+			expect(escMdUrl("http://x/(a)")).toBe("http://x/%28a%29");
+		});
+
+		it("percent-encodes whitespace, angle brackets, and double quote", () => {
+			expect(escMdUrl('a b<c>d"e')).toBe("a%20b%3Cc%3Ed%22e");
+		});
+
+		it("prevents link breakout via crafted url", () => {
+			// A `)` in the URL must be encoded so it cannot close the link target.
+			expect(escMdUrl("http://x)evil")).toBe("http://x%29evil");
+		});
+
+		it("leaves a clean url unchanged", () => {
+			expect(escMdUrl("https://example.com/path")).toBe(
+				"https://example.com/path",
+			);
+		});
+
+		it("handles empty string", () => {
+			expect(escMdUrl("")).toBe("");
+		});
+	});
+
+	// ── formatDate ───────────────────────────────────────────────────────────
+
+	describe("formatDate", () => {
+		it("formats a valid ISO date to short month/day/year", () => {
+			const result = formatDate("2026-03-15T10:30:00.000Z");
+			// Exact format depends on locale but should contain "Mar" and "2026"
+			expect(result).toContain("Mar");
+			expect(result).toContain("2026");
+			expect(result).toContain("15");
+		});
+
+		it("returns the raw string for invalid dates (catch branch)", () => {
+			// Date constructor with garbage produces "Invalid Date" which toLocaleDateString
+			// may still work on, but formatDate catches errors. We test the fallback.
+			// Note: In most JS engines "Invalid Date" won't throw, so we test with a value
+			// that produces a valid Date but non-throwing result.
+			const result = formatDate("not-a-date");
+			// Should be either the formatted "Invalid Date" or the raw string
+			expect(typeof result).toBe("string");
+		});
+
+		it("returns the raw string when Date constructor throws (catch branch)", () => {
+			const OriginalDate = globalThis.Date;
+			const spy = vi
+				.spyOn(globalThis, "Date")
+				.mockImplementation((...args: Array<unknown>) => {
+					if (args.length > 0 && args[0] === "throw-trigger") {
+						throw new Error("forced error");
+					}
+					// biome-ignore lint/suspicious/noExplicitAny: test mock
+					return new OriginalDate(...(args as [any]));
+				});
+
+			const result = formatDate("throw-trigger");
+
+			expect(result).toBe("throw-trigger");
+			spy.mockRestore();
+		});
+	});
+
+	// ── formatFullDate ───────────────────────────────────────────────────────
+
+	describe("formatFullDate", () => {
+		it("formats a valid ISO date to long month with time", () => {
+			// Use midday UTC to avoid day-boundary shifts across timezones
+			const result = formatFullDate("2026-03-15T12:00:00.000Z");
+			expect(result).toContain("March");
+			expect(result).toContain("2026");
+			expect(result).toContain("15");
+		});
+
+		it("returns the raw string for invalid dates", () => {
+			const result = formatFullDate("garbage");
+			expect(typeof result).toBe("string");
+		});
+
+		it("returns the raw string when Date constructor throws (catch branch)", () => {
+			const OriginalDate = globalThis.Date;
+			const spy = vi
+				.spyOn(globalThis, "Date")
+				.mockImplementation((...args: Array<unknown>) => {
+					if (args.length > 0 && args[0] === "throw-trigger") {
+						throw new Error("forced error");
+					}
+					// biome-ignore lint/suspicious/noExplicitAny: test mock
+					return new OriginalDate(...(args as [any]));
+				});
+
+			const result = formatFullDate("throw-trigger");
+
+			expect(result).toBe("throw-trigger");
+			spy.mockRestore();
+		});
+	});
+
+	// ── timeAgo ──────────────────────────────────────────────────────────────
+
+	describe("timeAgo", () => {
+		beforeEach(() => {
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date("2026-03-30T12:00:00.000Z"));
+		});
+
+		it("returns 'Just now' for less than 1 minute ago", () => {
+			expect(timeAgo("2026-03-30T11:59:30.000Z")).toBe("Just now");
+		});
+
+		it("returns '1 minute ago' for exactly 1 minute", () => {
+			expect(timeAgo("2026-03-30T11:59:00.000Z")).toBe("1 minute ago");
+		});
+
+		it("returns 'N minutes ago' for 2+ minutes", () => {
+			expect(timeAgo("2026-03-30T11:55:00.000Z")).toBe("5 minutes ago");
+		});
+
+		it("returns '1 hour ago' for exactly 1 hour", () => {
+			expect(timeAgo("2026-03-30T11:00:00.000Z")).toBe("1 hour ago");
+		});
+
+		it("returns 'N hours ago' for 2+ hours", () => {
+			expect(timeAgo("2026-03-30T07:00:00.000Z")).toBe("5 hours ago");
+		});
+
+		it("returns 'Yesterday' for exactly 1 day ago", () => {
+			expect(timeAgo("2026-03-29T12:00:00.000Z")).toBe("Yesterday");
+		});
+
+		it("returns 'N days ago' for 2-30 days", () => {
+			expect(timeAgo("2026-03-27T12:00:00.000Z")).toBe("3 days ago");
+		});
+
+		it("falls back to formatDate for more than 30 days", () => {
+			const result = timeAgo("2026-02-01T12:00:00.000Z");
+			// Should be a formatted date string, not "N days ago"
+			expect(result).toContain("Feb");
+			expect(result).toContain("2026");
+		});
+
+		it("returns the raw string on error (catch branch)", () => {
+			// Force an error by using a value that won't parse
+			// In practice the try/catch handles unexpected errors
+			const result = timeAgo("invalid-date");
+			// NaN comparisons all return false, so all if-checks fail => "Just now" or
+			// the string itself if it throws. Either way it should be a string.
+			expect(typeof result).toBe("string");
+		});
+
+		it("returns the raw string when Date constructor throws (catch branch)", () => {
+			vi.useRealTimers();
+			const OriginalDate = globalThis.Date;
+			const spy = vi
+				.spyOn(globalThis, "Date")
+				.mockImplementation((...args: Array<unknown>) => {
+					if (args.length > 0 && args[0] === "throw-trigger") {
+						throw new Error("forced error");
+					}
+					// biome-ignore lint/suspicious/noExplicitAny: test mock
+					return new OriginalDate(...(args as [any]));
+				});
+
+			const result = timeAgo("throw-trigger");
+
+			expect(result).toBe("throw-trigger");
+			spy.mockRestore();
+		});
+	});
+
+	// ── sortTopics ───────────────────────────────────────────────────────────
+
+	describe("sortTopics", () => {
+		it("sorts by source date descending (newest first)", () => {
+			const topics: Array<TopicWithDate> = [
+				makeTopic({ commitDate: "2026-03-10T08:00:00Z" }),
+				makeTopic({ commitDate: "2026-03-15T08:00:00Z" }),
+				makeTopic({ commitDate: "2026-03-12T08:00:00Z" }),
+			];
+			const sorted = sortTopics(topics);
+			expect(sorted[0].commitDate).toContain("2026-03-15");
+			expect(sorted[1].commitDate).toContain("2026-03-12");
+			expect(sorted[2].commitDate).toContain("2026-03-10");
+		});
+
+		it("sorts major before minor on the same day", () => {
+			const topics: Array<TopicWithDate> = [
+				makeTopic({ commitDate: "2026-03-15T10:00:00Z", importance: "minor" }),
+				makeTopic({ commitDate: "2026-03-15T08:00:00Z", importance: "major" }),
+			];
+			const sorted = sortTopics(topics);
+			expect(sorted[0].importance).toBe("major");
+			expect(sorted[1].importance).toBe("minor");
+		});
+
+		it("treats topics without any date as sort-last", () => {
+			const topics: Array<TopicWithDate> = [
+				makeTopic({ commitDate: undefined }),
+				makeTopic({ commitDate: "2026-03-15T10:00:00Z" }),
+			];
+			const sorted = sortTopics(topics);
+			expect(sorted[0].commitDate).toContain("2026-03-15");
+			expect(sorted[1].commitDate).toBeUndefined();
+		});
+
+		it("sorts major before minor on the same day when minor comes first in input", () => {
+			const topics: Array<TopicWithDate> = [
+				makeTopic({
+					commitDate: "2026-03-15T14:00:00Z",
+					importance: "minor",
+					title: "Minor task",
+				}),
+				makeTopic({
+					commitDate: "2026-03-15T10:00:00Z",
+					importance: "major",
+					title: "Major task",
+				}),
+				makeTopic({
+					commitDate: "2026-03-15T08:00:00Z",
+					importance: "minor",
+					title: "Another minor",
+				}),
+			];
+			const sorted = sortTopics(topics);
+			expect(sorted[0].importance).toBe("major");
+			expect(sorted[1].importance).toBe("minor");
+			expect(sorted[2].importance).toBe("minor");
+		});
+
+		it("treats undefined importance as major (sorts before minor)", () => {
+			const topics: Array<TopicWithDate> = [
+				makeTopic({ commitDate: "2026-03-15T10:00:00Z", importance: "minor" }),
+				makeTopic({
+					commitDate: "2026-03-15T08:00:00Z",
+					importance: undefined,
+				}),
+			];
+			const sorted = sortTopics(topics);
+			expect(sorted[0].importance).toBeUndefined();
+			expect(sorted[1].importance).toBe("minor");
+		});
+
+		it("does not mutate the original array", () => {
+			const topics: Array<TopicWithDate> = [
+				makeTopic({ commitDate: "2026-03-10T08:00:00Z" }),
+				makeTopic({ commitDate: "2026-03-15T08:00:00Z" }),
+			];
+			const originalFirst = topics[0];
+			sortTopics(topics);
+			expect(topics[0]).toBe(originalFirst);
+		});
+
+		it("returns empty array for empty input", () => {
+			expect(sortTopics([])).toEqual([]);
+		});
+	});
+
+	// ── padIndex ─────────────────────────────────────────────────────────────
+
+	describe("padIndex", () => {
+		it("pads 0 to '01'", () => {
+			expect(padIndex(0)).toBe("01");
+		});
+
+		it("pads 8 to '09'", () => {
+			expect(padIndex(8)).toBe("09");
+		});
+
+		it("pads 9 to '10'", () => {
+			expect(padIndex(9)).toBe("10");
+		});
+
+		it("pads 99 to '100'", () => {
+			expect(padIndex(99)).toBe("100");
+		});
+
+		it("does not pad double-digit numbers", () => {
+			expect(padIndex(11)).toBe("12");
+		});
+	});
+
+	// ── renderCalloutText ────────────────────────────────────────────────────
+
+	describe("renderCalloutText", () => {
+		it("converts markdown unordered list (dash) to HTML ul/li", () => {
+			const result = renderCalloutText("- item one\n- item two");
+			expect(result).toBe("<ul><li>item one</li><li>item two</li></ul>");
+		});
+
+		it("converts markdown unordered list (asterisk) to HTML ul/li", () => {
+			const result = renderCalloutText("* item one\n* item two");
+			expect(result).toBe("<ul><li>item one</li><li>item two</li></ul>");
+		});
+
+		it("renders plain text with HTML escaping", () => {
+			const result = renderCalloutText("Hello <world>");
+			expect(result).toBe("Hello &lt;world&gt;");
+		});
+
+		it("converts inline **bold** to <strong> tags", () => {
+			const result = renderCalloutText("This is **bold** text");
+			expect(result).toBe("This is <strong>bold</strong> text");
+		});
+
+		it("handles bold inside list items", () => {
+			const result = renderCalloutText("- **bold** item");
+			expect(result).toBe("<ul><li><strong>bold</strong> item</li></ul>");
+		});
+
+		it("handles mixed list and non-list lines", () => {
+			const result = renderCalloutText(
+				"Intro text\n- item one\n- item two\nOutro text",
+			);
+			expect(result).toBe(
+				"Intro text<br><ul><li>item one</li><li>item two</li></ul><br>Outro text",
+			);
+		});
+
+		it("skips empty lines", () => {
+			const result = renderCalloutText("line one\n\nline two");
+			expect(result).toBe("line one<br>line two");
+		});
+
+		it("handles empty string", () => {
+			expect(renderCalloutText("")).toBe("");
+		});
+
+		it("escapes HTML in list items", () => {
+			const result = renderCalloutText("- <script>alert('xss')</script>");
+			expect(result).toContain("&lt;script&gt;");
+		});
+
+		it("flushes trailing list items", () => {
+			const result = renderCalloutText("header\n- a\n- b");
+			expect(result).toBe("header<br><ul><li>a</li><li>b</li></ul>");
+		});
+	});
+
+	// ── buildPanelTitle ──────────────────────────────────────────────────────
+
+	describe("buildPanelTitle", () => {
+		it("builds title with date, ticketId, hash, and author", () => {
+			const summary = makeSummary({ ticketId: "PROJ-100" });
+			const result = buildPanelTitle(summary);
+			expect(result).toBe("2026-03-15 · PROJ-100 · abc1234 · Alice");
+		});
+
+		it("extracts ticket from commit message as fallback", () => {
+			const summary = makeSummary({
+				ticketId: undefined,
+				commitMessage: "Fixes PROJ-42: some bug",
+			});
+			const result = buildPanelTitle(summary);
+			expect(result).toContain("PROJ-42");
+		});
+
+		it("extracts ticket from branch name as fallback (uppercased)", () => {
+			const summary = makeSummary({
+				ticketId: undefined,
+				commitMessage: "some bug fix",
+				branch: "feature/proj-123-description",
+			});
+			const result = buildPanelTitle(summary);
+			expect(result).toContain("PROJ-123");
+		});
+
+		it("omits ticket when not found anywhere", () => {
+			const summary = makeSummary({
+				ticketId: undefined,
+				commitMessage: "no ticket here",
+				branch: "main",
+			});
+			const result = buildPanelTitle(summary);
+			expect(result).toBe("2026-03-15 · abc1234 · Alice");
+		});
+
+		it("truncates hash to 7 characters", () => {
+			const summary = makeSummary({ commitHash: "abcdef1234567890" });
+			const result = buildPanelTitle(summary);
+			expect(result).toContain("abcdef1");
+			expect(result).not.toContain("abcdef12");
+		});
+	});
+
+	// ── buildPushTitle ───────────────────────────────────────────────────────
+
+	describe("buildPushTitle", () => {
+		it("returns just the commit message with no metadata prefix", () => {
+			const summary = makeSummary({ ticketId: "PROJ-100" });
+			const result = buildPushTitle(summary);
+			expect(result).toBe("Fix some bug");
+		});
+	});
+
+	// ── buildPlanPushTitle ───────────────────────────────────────────────────
+
+	describe("buildPlanPushTitle", () => {
+		it("returns just the plan title with no metadata prefix", () => {
+			const summary = makeSummary({ ticketId: "PROJ-100" });
+			const result = buildPlanPushTitle(summary, "My Plan");
+			expect(result).toBe("My Plan");
+		});
+	});
+
+	// ── buildNotePushTitle ───────────────────────────────────────────────────
+
+	describe("buildNotePushTitle", () => {
+		it("returns just the note title with no metadata prefix", () => {
+			const summary = makeSummary({ ticketId: "PROJ-200" });
+			const result = buildNotePushTitle(summary, "Release Notes");
+			expect(result).toBe("Release Notes");
+		});
+	});
+
+	// ── collectSortedTopics ──────────────────────────────────────────────────
+
+	describe("collectSortedTopics", () => {
+		beforeEach(() => {
+			mockCollectDisplayTopics.mockReset();
+			mockCollectSourceNodes.mockReset();
+			mockComputeDurationDays.mockReset();
+		});
+
+		it("returns flat sorted topics from collectDisplayTopics output", () => {
+			const summary = makeSummary();
+			const rawTopics = [
+				makeTopic({
+					title: "A",
+					commitDate: "2026-03-10T08:00:00Z",
+					importance: "minor",
+				}),
+				makeTopic({
+					title: "B",
+					commitDate: "2026-03-15T08:00:00Z",
+					importance: "major",
+				}),
+			];
+			mockCollectSourceNodes.mockReturnValue([makeSummary(), makeSummary()]);
+			mockCollectDisplayTopics.mockReturnValue(rawTopics);
+
+			const result = collectSortedTopics(summary);
+
+			expect(result.sourceNodes.length).toBe(2);
+			// Sorted: newest first
+			expect(result.topics[0].title).toBe("B");
+			expect(result.topics[1].title).toBe("A");
+		});
+
+		it("returns the source nodes array for the Source Commits section", () => {
+			const summary = makeSummary();
+			mockCollectSourceNodes.mockReturnValue([makeSummary()]);
+			mockCollectDisplayTopics.mockReturnValue([
+				makeTopic({ title: "A", commitDate: "2026-03-15T08:00:00Z" }),
+			]);
+
+			const result = collectSortedTopics(summary);
+
+			expect(result.sourceNodes).toHaveLength(1);
+		});
+
+		it("assigns treeIndex based on original array index from collectDisplayTopics", () => {
+			const summary = makeSummary();
+			const rawTopics = [
+				makeTopic({ title: "First", commitDate: "2026-03-10T08:00:00Z" }),
+				makeTopic({ title: "Second", commitDate: "2026-03-15T08:00:00Z" }),
+			];
+			mockCollectSourceNodes.mockReturnValue([makeSummary()]);
+			mockCollectDisplayTopics.mockReturnValue(rawTopics);
+
+			const result = collectSortedTopics(summary);
+
+			// treeIndex reflects the original collectDisplayTopics order, independent
+			// of the post-sort display order.
+			const first = result.topics.find((t) => t.title === "First");
+			const second = result.topics.find((t) => t.title === "Second");
+			expect(first?.treeIndex).toBe(0);
+			expect(second?.treeIndex).toBe(1);
+		});
+	});
+
+	// ── collectAllPlans ──────────────────────────────────────────────────────
+
+	describe("collectAllPlans", () => {
+		function makePlan(overrides: Partial<PlanReference> = {}): PlanReference {
+			return {
+				slug: "plan-slug",
+				title: "My Plan",
+				addedAt: "2026-03-10T08:00:00Z",
+				updatedAt: "2026-03-15T08:00:00Z",
+				...overrides,
+			};
+		}
+
+		it("collects plans from a leaf node", () => {
+			const summary = makeSummary({
+				plans: [makePlan({ slug: "plan-a" })],
+			});
+			const plans = collectAllPlans(summary);
+			expect(plans).toHaveLength(1);
+			expect(plans[0].slug).toBe("plan-a");
+		});
+
+		it("collects plans recursively from children", () => {
+			const summary = makeSummary({
+				plans: [makePlan({ slug: "plan-a" })],
+				children: [
+					makeSummary({
+						plans: [makePlan({ slug: "plan-b" })],
+					}),
+				],
+			});
+			const plans = collectAllPlans(summary);
+			expect(plans).toHaveLength(2);
+			const slugs = plans.map((p) => p.slug);
+			expect(slugs).toContain("plan-a");
+			expect(slugs).toContain("plan-b");
+		});
+
+		it("deduplicates by slug, keeping the one with the latest updatedAt", () => {
+			const summary = makeSummary({
+				plans: [
+					makePlan({ slug: "plan-a", updatedAt: "2026-03-15T08:00:00Z" }),
+				],
+				children: [
+					makeSummary({
+						plans: [
+							makePlan({
+								slug: "plan-a",
+								updatedAt: "2026-03-20T08:00:00Z",
+								title: "Updated Plan",
+							}),
+						],
+					}),
+				],
+			});
+			const plans = collectAllPlans(summary);
+			expect(plans).toHaveLength(1);
+			expect(plans[0].title).toBe("Updated Plan");
+		});
+
+		it("keeps earlier version when child has older updatedAt", () => {
+			const summary = makeSummary({
+				plans: [
+					makePlan({
+						slug: "plan-a",
+						updatedAt: "2026-03-20T08:00:00Z",
+						title: "Newer",
+					}),
+				],
+				children: [
+					makeSummary({
+						plans: [
+							makePlan({
+								slug: "plan-a",
+								updatedAt: "2026-03-10T08:00:00Z",
+								title: "Older",
+							}),
+						],
+					}),
+				],
+			});
+			const plans = collectAllPlans(summary);
+			expect(plans).toHaveLength(1);
+			expect(plans[0].title).toBe("Newer");
+		});
+
+		it("returns empty array when no plans exist", () => {
+			const summary = makeSummary({
+				children: [makeSummary()],
+			});
+			const plans = collectAllPlans(summary);
+			expect(plans).toHaveLength(0);
+		});
+
+		it("handles deeply nested children", () => {
+			const summary = makeSummary({
+				children: [
+					makeSummary({
+						children: [
+							makeSummary({
+								plans: [makePlan({ slug: "deep-plan" })],
+							}),
+						],
+					}),
+				],
+			});
+			const plans = collectAllPlans(summary);
+			expect(plans).toHaveLength(1);
+			expect(plans[0].slug).toBe("deep-plan");
+		});
+
+		it("handles node with no plans and no children", () => {
+			const summary = makeSummary();
+			const plans = collectAllPlans(summary);
+			expect(plans).toHaveLength(0);
+		});
+	});
+
+	describe("buildBranchRelativePath", () => {
+		it("returns just the branch slug for any push (summary/plan/note)", () => {
+			expect(buildBranchRelativePath("main")).toBe("main");
+		});
+
+		it("preserves slashes in feature branches", () => {
+			expect(buildBranchRelativePath("feature/oauth")).toBe("feature/oauth");
+		});
+
+		it("sanitizes unsafe characters", () => {
+			expect(buildBranchRelativePath("feat: oauth + sso")).toBe(
+				"feat_oauth_sso",
+			);
+		});
+
+		it("uses _ as fallback for empty branch", () => {
+			expect(buildBranchRelativePath(undefined)).toBe("_");
+			expect(buildBranchRelativePath("")).toBe("_");
+		});
+	});
+
+	describe("LLM provider attribution (collectLlmSources / formatProviderLabel)", () => {
+		// Minimal CommitSummary scaffolding — only the fields the walker reads.
+		// Tests pin the *behavior* the footer renderers depend on:
+		//   1. Single-source summaries return the matching label.
+		//   2. Multi-source summaries (e.g. squash containers whose children
+		//      were summarized on different machines) get a "mixed: …" label.
+		//   3. Pre-attribution summaries (no `source` anywhere) return undefined,
+		//      so the footer can omit the segment instead of printing "via unknown".
+		const baseNode = {
+			version: 3 as const,
+			commitHash: "abc",
+			commitMessage: "x",
+			commitAuthor: "y",
+			commitDate: "2026-01-01T00:00:00Z",
+			branch: "main",
+			generatedAt: "2026-01-01T00:00:00Z",
+		};
+
+		function nodeWithSource(
+			source: "anthropic-config" | "anthropic-env" | "jolli-proxy" | undefined,
+			children?: ReadonlyArray<CommitSummary>,
+		): CommitSummary {
+			return {
+				...baseNode,
+				llm: source
+					? {
+							model: "claude-sonnet-4-6",
+							inputTokens: 1,
+							outputTokens: 1,
+							apiLatencyMs: 1,
+							stopReason: "end_turn",
+							source,
+						}
+					: undefined,
+				children,
+			};
+		}
+
+		it("returns the single source label for a leaf summary", () => {
+			expect(formatProviderLabel(nodeWithSource("anthropic-config"))).toBe(
+				"Anthropic",
+			);
+			expect(formatProviderLabel(nodeWithSource("anthropic-env"))).toBe(
+				"Anthropic (env)",
+			);
+			expect(formatProviderLabel(nodeWithSource("jolli-proxy"))).toBe(
+				"Jolli proxy",
+			);
+		});
+
+		it("recurses into children when the root node has no llm (squash containers)", () => {
+			const squash = nodeWithSource(undefined, [
+				nodeWithSource("anthropic-env"),
+				nodeWithSource("anthropic-env"),
+			]);
+			expect(collectLlmSources(squash)).toEqual(["anthropic-env"]);
+			expect(formatProviderLabel(squash)).toBe("Anthropic (env)");
+		});
+
+		it("returns mixed label when distinct sources appear across the tree", () => {
+			const mixed = nodeWithSource(undefined, [
+				nodeWithSource("anthropic-config"),
+				nodeWithSource("jolli-proxy"),
+			]);
+			expect(formatProviderLabel(mixed)).toBe("mixed: Anthropic, Jolli proxy");
+		});
+
+		it("returns undefined for pre-attribution summaries (no source anywhere)", () => {
+			// Critical for the footer fallback: without this, footer would
+			// print "via undefined" or "via unknown" on every legacy summary.
+			expect(collectLlmSources(nodeWithSource(undefined))).toEqual([]);
+			expect(formatProviderLabel(nodeWithSource(undefined))).toBeUndefined();
+		});
+	});
+
+	describe("formatActiveProviderLabel — current-config attribution for previews", () => {
+		const origEnv = process.env.ANTHROPIC_API_KEY;
+		afterEach(() => {
+			if (origEnv === undefined) delete process.env.ANTHROPIC_API_KEY;
+			else process.env.ANTHROPIC_API_KEY = origEnv;
+		});
+
+		it("returns 'Jolli proxy' when aiProvider is jolli AND jolliApiKey is set", () => {
+			expect(
+				formatActiveProviderLabel({ aiProvider: "jolli", jolliApiKey: "jk" } as never),
+			).toBe("Jolli proxy");
+		});
+
+		it("returns undefined when aiProvider is jolli but jolliApiKey is missing", () => {
+			expect(formatActiveProviderLabel({ aiProvider: "jolli" } as never)).toBeUndefined();
+		});
+
+		it("returns 'Anthropic' when aiProvider is anthropic with config apiKey", () => {
+			expect(
+				formatActiveProviderLabel({ aiProvider: "anthropic", apiKey: "k" } as never),
+			).toBe("Anthropic");
+		});
+
+		it("returns 'Anthropic (env)' when aiProvider is anthropic with only env apiKey", () => {
+			delete process.env.ANTHROPIC_API_KEY;
+			process.env.ANTHROPIC_API_KEY = "envkey";
+			expect(formatActiveProviderLabel({ aiProvider: "anthropic" } as never)).toBe(
+				"Anthropic (env)",
+			);
+		});
+
+		it("returns undefined when aiProvider is anthropic but no apiKey anywhere", () => {
+			delete process.env.ANTHROPIC_API_KEY;
+			expect(formatActiveProviderLabel({ aiProvider: "anthropic" } as never)).toBeUndefined();
+		});
+
+		it("falls back via legacy precedence when aiProvider is unset", () => {
+			delete process.env.ANTHROPIC_API_KEY;
+			expect(formatActiveProviderLabel({ apiKey: "k" } as never)).toBe("Anthropic");
+			process.env.ANTHROPIC_API_KEY = "envkey";
+			expect(formatActiveProviderLabel({} as never)).toBe("Anthropic (env)");
+			delete process.env.ANTHROPIC_API_KEY;
+			expect(formatActiveProviderLabel({ jolliApiKey: "jk" } as never)).toBe("Jolli proxy");
+		});
+
+		it("returns undefined when nothing is configured", () => {
+			delete process.env.ANTHROPIC_API_KEY;
+			expect(formatActiveProviderLabel({} as never)).toBeUndefined();
+		});
+	});
+
+	// ─── formatTokensCompact / formatSonnetCostEstimate ─────────────────────────
+	// Shared by the sidebar's token bar (as inlined client JS text) and the
+	// Commit Memory panel's token meter (calling these directly) so the two
+	// surfaces never disagree on the same underlying token counts.
+
+	describe("formatTokensCompact", () => {
+		it("renders sub-1000 counts as a bare number", () => {
+			expect(formatTokensCompact(500)).toBe("500");
+			expect(formatTokensCompact(0)).toBe("0");
+		});
+
+		it("renders thousands with a 'k' suffix, rounded", () => {
+			expect(formatTokensCompact(5000)).toBe("5k");
+			expect(formatTokensCompact(96499)).toBe("96k");
+		});
+
+		it("renders millions with an 'M' suffix and one decimal", () => {
+			expect(formatTokensCompact(1443000)).toBe("1.4M");
+		});
+
+		it("strips a trailing '.0' for round millions", () => {
+			expect(formatTokensCompact(2000000)).toBe("2M");
+		});
+
+		it("promotes counts that would round up to 1000k into the 'M' form", () => {
+			// 999_800 / 1000 rounds to 1000 — must render "1M", not "1000k".
+			expect(formatTokensCompact(999_800)).toBe("1M");
+			expect(formatTokensCompact(999_500)).toBe("1M");
+			// Just below the promotion boundary still reads as 999k.
+			expect(formatTokensCompact(999_499)).toBe("999k");
+		});
+	});
+
+	describe("formatSonnetCostEstimate", () => {
+		it("floors sub-cent estimates to '<$0.01'", () => {
+			expect(formatSonnetCostEstimate(0.001)).toBe("<$0.01");
+		});
+
+		it("renders cent-and-above estimates as '≈$X.XX'", () => {
+			expect(formatSonnetCostEstimate(4.329)).toBe("≈$4.33");
+			expect(formatSonnetCostEstimate(0.01)).toBe("≈$0.01");
+		});
+	});
+});

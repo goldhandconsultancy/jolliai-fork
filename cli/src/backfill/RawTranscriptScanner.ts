@@ -16,8 +16,12 @@
  *                          calls (the file-orthogonality anchor)
  *   - `role` / `content` — the conversational turn (fed to the summarizer)
  *
- * Only Claude Code is supported for now (the `source` field is fixed to
- * "claude"); the record shape leaves room for other sources later.
+ * This module itself only scans Claude Code transcripts (the `source` field
+ * is always "claude" for records it produces), but {@link RawEntry}'s
+ * `source` is typed to also admit "copilot-chat" — the sibling
+ * `RawCopilotChatTranscriptScanner` produces entries in this same shape so
+ * {@link CommitAttributor} (`../backfill/CommitAttributor.js`) can attribute
+ * across both sources uniformly.
  */
 
 import { readdir, readFile } from "node:fs/promises";
@@ -29,11 +33,11 @@ import { createLogger } from "../Logger.js";
 
 const log = createLogger("RawTranscriptScanner");
 
-/** One indexed Claude JSONL line with the signals the attributor consumes. */
+/** One indexed transcript line with the signals the attributor consumes. */
 export interface RawEntry {
 	readonly sessionId: string;
 	readonly transcriptPath: string;
-	readonly source: "claude";
+	readonly source: "claude" | "copilot-chat";
 	readonly lineNo: number;
 	readonly ts?: string;
 	/** Epoch ms parsed from `ts`; `Number.NaN` when absent/unparseable. */

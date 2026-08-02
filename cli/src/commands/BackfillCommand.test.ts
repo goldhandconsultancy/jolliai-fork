@@ -172,6 +172,39 @@ describe("jolli backfill command", () => {
 		expect(vi.mocked(recentCommitHashes)).toHaveBeenCalled();
 	});
 
+	describe("--force", () => {
+		it("passes force through to runBackfill when combined with --hashes", async () => {
+			vi.mocked(runBackfill).mockResolvedValue({ ...report, outcomes: [] });
+			await makeProgram().parseAsync(["backfill", "--hashes", "h1", "--force"], { from: "user" });
+			expect(vi.mocked(runBackfill)).toHaveBeenCalledWith(
+				expect.objectContaining({ hashes: ["h1"], force: true }),
+			);
+		});
+
+		it("rejects --force without --hashes, without calling runBackfill", async () => {
+			await makeProgram().parseAsync(["backfill", "--force", "--last", "5"], { from: "user" });
+			expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("--force requires an explicit --hashes list"));
+			expect(process.exitCode).toBe(1);
+			expect(vi.mocked(runBackfill)).not.toHaveBeenCalled();
+			expect(vi.mocked(recentCommitHashes)).not.toHaveBeenCalled();
+		});
+
+		it("rejects --force with a --hashes list that resolves to only blanks", async () => {
+			await makeProgram().parseAsync(["backfill", "--force", "--hashes", " , ,"], { from: "user" });
+			expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("--force requires an explicit --hashes list"));
+			expect(process.exitCode).toBe(1);
+			expect(vi.mocked(runBackfill)).not.toHaveBeenCalled();
+		});
+
+		it("omits force from the runBackfill call when not passed (undefined, not false)", async () => {
+			vi.mocked(recentCommitHashes).mockResolvedValue(["h1"]);
+			vi.mocked(runBackfill).mockResolvedValue({ ...report, outcomes: [] });
+			await makeProgram().parseAsync(["backfill"], { from: "user" });
+			const call = vi.mocked(runBackfill).mock.calls[0][0];
+			expect(call.force).toBeUndefined();
+		});
+	});
+
 	it("--stream emits NDJSON progress events then a final report line", async () => {
 		vi.mocked(recentCommitHashes).mockResolvedValue(["h1", "h2"]);
 		vi.mocked(runBackfill).mockImplementation(async (opts) => {

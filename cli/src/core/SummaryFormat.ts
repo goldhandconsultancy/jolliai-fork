@@ -130,6 +130,7 @@ const PROVIDER_LABELS: Record<LlmCredentialSource, string> = {
 	"anthropic-env": "Anthropic (env)",
 	"jolli-proxy": "Jolli proxy",
 	"local-agent": "Local agent",
+	"azure-foundry": "Azure Foundry",
 };
 
 /**

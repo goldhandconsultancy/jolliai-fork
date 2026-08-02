@@ -136,6 +136,69 @@ describe("LlmClient", () => {
 		}
 	});
 
+	describe("languageDirective (summaryLanguage)", () => {
+		it("injects no LANGUAGE directive when summaryLanguage is unset (byte-for-byte pre-existing behavior)", async () => {
+			await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				apiKey: "sk-ant-test",
+				maxTokens: 256,
+			});
+			const prompt = mockCreate.mock.calls[0][0].messages[0].content as string;
+			expect(prompt).not.toContain("LANGUAGE:");
+			expect(prompt).not.toContain("{{languageDirective}}");
+		});
+
+		it("injects a LANGUAGE directive naming the configured language", async () => {
+			await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				apiKey: "sk-ant-test",
+				maxTokens: 256,
+				summaryLanguage: "Dutch",
+			});
+			const prompt = mockCreate.mock.calls[0][0].messages[0].content as string;
+			expect(prompt).toContain("LANGUAGE: Write all reader-facing prose content of your response in Dutch.");
+			expect(prompt).not.toContain("{{languageDirective}}");
+		});
+
+		it("trims surrounding whitespace from the configured language", async () => {
+			await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				apiKey: "sk-ant-test",
+				maxTokens: 256,
+				summaryLanguage: "  German  ",
+			});
+			const prompt = mockCreate.mock.calls[0][0].messages[0].content as string;
+			expect(prompt).toContain("in German.");
+		});
+
+		it("treats a whitespace-only summaryLanguage as unset", async () => {
+			await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				apiKey: "sk-ant-test",
+				maxTokens: 256,
+				summaryLanguage: "   ",
+			});
+			const prompt = mockCreate.mock.calls[0][0].messages[0].content as string;
+			expect(prompt).not.toContain("LANGUAGE:");
+		});
+
+		it("does not translate a template with no {{languageDirective}} placeholder (e.g. translate action)", async () => {
+			await callLlm({
+				action: "translate",
+				params: { content: "# Test" },
+				apiKey: "sk-ant-test",
+				maxTokens: 256,
+				summaryLanguage: "Dutch",
+			});
+			const prompt = mockCreate.mock.calls[0][0].messages[0].content as string;
+			expect(prompt).not.toContain("LANGUAGE:");
+		});
+	});
+
 	describe("direct mode", () => {
 		it("resolves the prompt template from the action and fills params", async () => {
 			// maxTokens 256 + a tiny prompt keeps this on the non-streaming
@@ -1283,6 +1346,345 @@ describe("LlmClient", () => {
 		});
 	});
 
+	describe("azure-foundry mode", () => {
+		let fetchSpy: ReturnType<typeof vi.fn>;
+
+		const okResponse = (overrides: Record<string, unknown> = {}) => ({
+			ok: true,
+			text: vi.fn().mockResolvedValue(""),
+			json: vi.fn().mockResolvedValue({
+				choices: [{ message: { content: "azure result" }, finish_reason: "stop" }],
+				usage: { prompt_tokens: 40, completion_tokens: 8 },
+				model: "gpt-4.1-mini",
+				...overrides,
+			}),
+		});
+
+		beforeEach(() => {
+			fetchSpy = vi.fn().mockResolvedValue(okResponse());
+			vi.stubGlobal("fetch", fetchSpy);
+		});
+
+		afterEach(() => {
+			vi.unstubAllGlobals();
+		});
+
+		it("builds the classic deployment URL and posts with api-key auth (no jolli headers)", async () => {
+			const result = await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				azureEndpoint: "https://my-resource.openai.azure.com",
+				azureApiKey: "azure-secret",
+				azureDeployment: "gpt-4.1-mini",
+			});
+
+			expect(fetchSpy).toHaveBeenCalledWith(
+				"https://my-resource.openai.azure.com/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2024-06-01",
+				expect.objectContaining({ method: "POST" }),
+			);
+			const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+			const headers = init.headers as Record<string, string>;
+			expect(headers["api-key"]).toBe("azure-secret");
+			expect(headers["Content-Type"]).toBe("application/json");
+			expect(headers["x-jolli-client"]).toBeUndefined();
+			expect(headers["x-jolli-trace"]).toBeUndefined();
+			const body = JSON.parse(init.body as string);
+			expect(body.model).toBeUndefined();
+			expect(body.messages).toEqual([{ role: "user", content: expect.any(String) }]);
+			// max_completion_tokens, not max_tokens — reasoning-capable models
+			// (o-series, GPT-5.x) reject max_tokens with a 400 "Unsupported
+			// parameter" error on both URL shapes.
+			expect(body.max_completion_tokens).toBe(8192);
+			expect(body).not.toHaveProperty("max_tokens");
+
+			expect(result.text).toBe("azure result");
+			expect(result.model).toBe("gpt-4.1-mini");
+			expect(result.inputTokens).toBe(40);
+			expect(result.outputTokens).toBe(8);
+			expect(result.stopReason).toBe("stop");
+			expect(result.source).toBe("azure-foundry");
+		});
+
+		it("honors an explicit azureApiVersion override in classic mode", async () => {
+			await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				azureEndpoint: "https://my-resource.openai.azure.com/",
+				azureApiKey: "azure-secret",
+				azureDeployment: "gpt-4.1-mini",
+				azureApiVersion: "2024-10-21",
+			});
+
+			expect(fetchSpy).toHaveBeenCalledWith(
+				"https://my-resource.openai.azure.com/openai/deployments/gpt-4.1-mini/chat/completions?api-version=2024-10-21",
+				expect.anything(),
+			);
+		});
+
+		it("sends a custom maxTokens as max_completion_tokens", async () => {
+			await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				azureEndpoint: "https://my-resource.openai.azure.com",
+				azureApiKey: "azure-secret",
+				azureDeployment: "gpt-4.1-mini",
+				maxTokens: 512,
+			});
+
+			const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+			const body = JSON.parse(init.body as string);
+			expect(body.max_completion_tokens).toBe(512);
+		});
+
+		it("uses a pre-built gateway URL verbatim and sends the deployment as `model` in the body", async () => {
+			await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				azureEndpoint: "https://gh-ai-gateway.azure-api.net/gh/openai/v1/chat/completions",
+				azureApiKey: "azure-secret",
+				azureDeployment: "gpt-4.1-mini",
+			});
+
+			expect(fetchSpy).toHaveBeenCalledWith(
+				"https://gh-ai-gateway.azure-api.net/gh/openai/v1/chat/completions",
+				expect.anything(),
+			);
+			const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+			const body = JSON.parse(init.body as string);
+			expect(body.model).toBe("gpt-4.1-mini");
+		});
+
+		it("appends api-version to a gateway URL only when explicitly set", async () => {
+			await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				azureEndpoint: "https://gh-ai-gateway.azure-api.net/gh/openai/v1/chat/completions",
+				azureApiKey: "azure-secret",
+				azureDeployment: "gpt-4.1-mini",
+				azureApiVersion: "preview",
+			});
+
+			expect(fetchSpy).toHaveBeenCalledWith(
+				"https://gh-ai-gateway.azure-api.net/gh/openai/v1/chat/completions?api-version=preview",
+				expect.anything(),
+			);
+		});
+
+		it("joins array-shaped content parts (some OpenAI-compatible gateways shape content this way)", async () => {
+			fetchSpy.mockResolvedValue(
+				okResponse({
+					choices: [
+						{
+							message: { content: [{ text: "part one" }, { text: "part two" }] },
+							finish_reason: "stop",
+						},
+					],
+				}),
+			);
+
+			const result = await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				azureEndpoint: "https://my-resource.openai.azure.com",
+				azureApiKey: "azure-secret",
+				azureDeployment: "gpt-4.1-mini",
+			});
+
+			expect(result.text).toBe("part one\npart two");
+		});
+
+		it("treats an array content part with no string `text` as empty rather than throwing", async () => {
+			fetchSpy.mockResolvedValue(
+				okResponse({
+					choices: [
+						{
+							message: { content: [{ text: "part one" }, {}] },
+							finish_reason: "stop",
+						},
+					],
+				}),
+			);
+
+			const result = await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				azureEndpoint: "https://my-resource.openai.azure.com",
+				azureApiKey: "azure-secret",
+				azureDeployment: "gpt-4.1-mini",
+			});
+
+			// The joined text is "part one\n" (empty second part); the final
+			// result is trimmed, so the trailing newline is gone.
+			expect(result.text).toBe("part one");
+		});
+
+		it("defaults token counts to 0 and stopReason to null when the response omits usage/finish_reason", async () => {
+			fetchSpy.mockResolvedValue({
+				ok: true,
+				text: vi.fn().mockResolvedValue(""),
+				json: vi.fn().mockResolvedValue({
+					choices: [{ message: { content: "azure result" } }],
+				}),
+			});
+
+			const result = await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				azureEndpoint: "https://my-resource.openai.azure.com",
+				azureApiKey: "azure-secret",
+				azureDeployment: "gpt-4.1-mini",
+			});
+
+			expect(result.inputTokens).toBe(0);
+			expect(result.outputTokens).toBe(0);
+			expect(result.stopReason).toBeNull();
+			expect(result.model).toBeUndefined();
+		});
+
+		it("logs a non-Error rejection from fetch without a formatted cause chain", async () => {
+			fetchSpy.mockRejectedValue("boom");
+
+			await expect(
+				callLlm({
+					action: "commit-message",
+					params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+					azureEndpoint: "https://my-resource.openai.azure.com",
+					azureApiKey: "azure-secret",
+					azureDeployment: "gpt-4.1-mini",
+				}),
+			).rejects.toBe("boom");
+			expect(mockLogError).toHaveBeenCalledWith(
+				expect.stringContaining("Azure Foundry LLM fetch failed"),
+				expect.anything(),
+				expect.anything(),
+				expect.anything(),
+				expect.anything(),
+				expect.stringContaining("boom"),
+				"(non-error)",
+			);
+		});
+
+		it("throws with the truncated response body when Azure returns a non-ok status", async () => {
+			fetchSpy.mockResolvedValue({
+				ok: false,
+				status: 429,
+				text: vi.fn().mockResolvedValue("rate limited by upstream"),
+			});
+
+			await expect(
+				callLlm({
+					action: "commit-message",
+					params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+					azureEndpoint: "https://my-resource.openai.azure.com",
+					azureApiKey: "azure-secret",
+					azureDeployment: "gpt-4.1-mini",
+				}),
+			).rejects.toThrow(/429.*rate limited by upstream/);
+		});
+
+		it("logs and rethrows on a network-level fetch failure", async () => {
+			const networkError = new Error("fetch failed");
+			fetchSpy.mockRejectedValue(networkError);
+
+			await expect(
+				callLlm({
+					action: "commit-message",
+					params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+					azureEndpoint: "https://my-resource.openai.azure.com",
+					azureApiKey: "azure-secret",
+					azureDeployment: "gpt-4.1-mini",
+				}),
+			).rejects.toThrow("fetch failed");
+			expect(mockLogError).toHaveBeenCalledWith(
+				expect.stringContaining("Azure Foundry LLM fetch failed"),
+				expect.anything(),
+				expect.anything(),
+				expect.anything(),
+				expect.anything(),
+				expect.anything(),
+				expect.anything(),
+			);
+		});
+
+		it("throws when the response has no usable text content", async () => {
+			fetchSpy.mockResolvedValue(
+				okResponse({ choices: [{ message: { content: "  " }, finish_reason: "stop" }] }),
+			);
+
+			await expect(
+				callLlm({
+					action: "commit-message",
+					params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+					azureEndpoint: "https://my-resource.openai.azure.com",
+					azureApiKey: "azure-secret",
+					azureDeployment: "gpt-4.1-mini",
+				}),
+			).rejects.toThrow("No text content in Azure Foundry response");
+		});
+
+		it("throws LlmCredentialError (not the Azure-specific error) when credentials are incomplete", async () => {
+			await expect(
+				callLlm({
+					action: "commit-message",
+					params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+					azureEndpoint: "https://my-resource.openai.azure.com",
+					azureApiKey: "azure-secret",
+					// azureDeployment missing
+				}),
+			).rejects.toThrow(NO_LLM_PROVIDER_MESSAGE);
+			expect(fetchSpy).not.toHaveBeenCalled();
+		});
+
+		it("throws when the action has no known template", async () => {
+			await expect(
+				callLlm({
+					action: "unknown-action",
+					params: {},
+					azureEndpoint: "https://my-resource.openai.azure.com",
+					azureApiKey: "azure-secret",
+					azureDeployment: "gpt-4.1-mini",
+				}),
+			).rejects.toThrow('Unknown LLM action: "unknown-action"');
+			expect(fetchSpy).not.toHaveBeenCalled();
+		});
+
+		it("warns when params do not fill every placeholder, but still calls out", async () => {
+			await callLlm({
+				action: "translate",
+				params: {},
+				azureEndpoint: "https://my-resource.openai.azure.com",
+				azureApiKey: "azure-secret",
+				azureDeployment: "gpt-4.1-mini",
+			});
+
+			expect(mockLogWarn).toHaveBeenCalledWith(
+				"Azure Foundry call has unfilled placeholders for action=%s: %s",
+				"translate",
+				"content",
+			);
+			expect(fetchSpy).toHaveBeenCalled();
+		});
+
+		it("throws when a credential field disappears between routing and the inner Azure call", async () => {
+			let reads = 0;
+			const options = {
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				azureApiKey: "azure-secret",
+				azureDeployment: "gpt-4.1-mini",
+				get azureEndpoint() {
+					reads += 1;
+					return reads === 1 ? "https://my-resource.openai.azure.com" : undefined;
+				},
+			} as unknown as Parameters<typeof callLlm>[0];
+
+			await expect(callLlm(options)).rejects.toThrow(
+				"Azure Foundry mode requires azureEndpoint, azureApiKey, and azureDeployment",
+			);
+			expect(fetchSpy).not.toHaveBeenCalled();
+		});
+	});
+
 	describe("no credentials", () => {
 		it("throws when neither apiKey nor jolliApiKey is provided", async () => {
 			await expect(
@@ -1411,6 +1813,80 @@ describe("LlmClient", () => {
 				expect(resolveLlmCredentialSource({ apiKey: "sk-ant-x" })).toBe("anthropic-config");
 			});
 		});
+
+		describe("azure-foundry", () => {
+			it("returns azure-foundry when aiProvider is azure-foundry and all three fields are set", () => {
+				expect(
+					resolveLlmCredentialSource({
+						aiProvider: "azure-foundry",
+						azureEndpoint: "https://my-resource.openai.azure.com",
+						azureApiKey: "secret",
+						azureDeployment: "gpt-4.1-mini",
+					}),
+				).toBe("azure-foundry");
+			});
+
+			it("aiProvider='azure-foundry' returns null when any Azure field is missing (no silent fallback)", () => {
+				process.env.ANTHROPIC_API_KEY = "sk-ant-env";
+				expect(
+					resolveLlmCredentialSource({
+						aiProvider: "azure-foundry",
+						azureEndpoint: "https://my-resource.openai.azure.com",
+						azureApiKey: "secret",
+						jolliApiKey: "sk-jol-test.secret",
+					}),
+				).toBeNull();
+			});
+
+			// This is the precedence fix: a fully configured Azure deployment is a
+			// deliberate one-time setup step, so — when aiProvider is left unset —
+			// it now outranks an ambient ANTHROPIC_API_KEY env var and a leftover
+			// jolliApiKey from a prior sign-in. Before this fix, either of those
+			// would silently win and route the call away from the user's own
+			// Azure resource despite Azure being fully configured.
+			it("without an explicit aiProvider, a fully configured Azure deployment outranks ANTHROPIC_API_KEY env", () => {
+				process.env.ANTHROPIC_API_KEY = "sk-ant-env";
+				expect(
+					resolveLlmCredentialSource({
+						azureEndpoint: "https://my-resource.openai.azure.com",
+						azureApiKey: "secret",
+						azureDeployment: "gpt-4.1-mini",
+					}),
+				).toBe("azure-foundry");
+			});
+
+			it("without an explicit aiProvider, a fully configured Azure deployment outranks a leftover jolliApiKey", () => {
+				expect(
+					resolveLlmCredentialSource({
+						azureEndpoint: "https://my-resource.openai.azure.com",
+						azureApiKey: "secret",
+						azureDeployment: "gpt-4.1-mini",
+						jolliApiKey: "sk-jol-test.secret",
+					}),
+				).toBe("azure-foundry");
+			});
+
+			it("a deliberate config apiKey still wins over Azure when aiProvider is unset", () => {
+				expect(
+					resolveLlmCredentialSource({
+						apiKey: "sk-ant-cfg",
+						azureEndpoint: "https://my-resource.openai.azure.com",
+						azureApiKey: "secret",
+						azureDeployment: "gpt-4.1-mini",
+					}),
+				).toBe("anthropic-config");
+			});
+
+			it("falls through to env var / jolliApiKey when Azure fields are only partially set", () => {
+				process.env.ANTHROPIC_API_KEY = "sk-ant-env";
+				expect(
+					resolveLlmCredentialSource({
+						azureEndpoint: "https://my-resource.openai.azure.com",
+						// azureApiKey / azureDeployment missing
+					}),
+				).toBe("anthropic-env");
+			});
+		});
 	});
 
 	describe("llmCredentials", () => {
@@ -1443,6 +1919,12 @@ describe("LlmClient", () => {
 				localAgentPath: undefined,
 				localAgentModel: undefined,
 			});
+		});
+
+		it("carries summaryLanguage through, same as every other credential dimension", () => {
+			expect(llmCredentials({ apiKey: "sk-ant-x", summaryLanguage: "Dutch" })).toEqual(
+				expect.objectContaining({ apiKey: "sk-ant-x", summaryLanguage: "Dutch" }),
+			);
 		});
 	});
 

@@ -35,10 +35,21 @@
 export function hasLlmCredentials(config: {
 	readonly apiKey?: string;
 	readonly jolliApiKey?: string;
-	readonly aiProvider?: "anthropic" | "jolli" | "local-agent";
+	readonly aiProvider?: "anthropic" | "jolli" | "local-agent" | "azure-foundry";
+	readonly azureEndpoint?: string;
+	readonly azureApiKey?: string;
+	readonly azureDeployment?: string;
 }): boolean {
 	if (config.aiProvider === "local-agent") return true;
+	if (config.aiProvider === "azure-foundry") {
+		return Boolean(config.azureEndpoint && config.azureApiKey && config.azureDeployment);
+	}
 	if (config.aiProvider === "jolli") return Boolean(config.jolliApiKey);
 	if (config.aiProvider === "anthropic") return Boolean(config.apiKey || process.env.ANTHROPIC_API_KEY);
-	return Boolean(config.apiKey || process.env.ANTHROPIC_API_KEY || config.jolliApiKey);
+	return Boolean(
+		config.apiKey ||
+			process.env.ANTHROPIC_API_KEY ||
+			config.jolliApiKey ||
+			(config.azureEndpoint && config.azureApiKey && config.azureDeployment),
+	);
 }
