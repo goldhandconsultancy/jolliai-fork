@@ -24,7 +24,6 @@ import {
 	isAncestor,
 	listFilesInBranch,
 	lsRemote,
-	orphanBranchExists,
 	pushRefspec,
 	readFileFromBranch,
 	writeMergeCommitToBranch,
@@ -259,10 +258,6 @@ export async function runLocalSyncRound(cwd: string, opts: RunLocalSyncRoundOpts
 	}
 	const destUrl = config.localSyncRepoUrl;
 
-	if (!(await orphanBranchExists(ORPHAN_BRANCH, cwd))) {
-		return { outcome: "up-to-date", message: "no orphan branch yet — nothing to sync" };
-	}
-
 	const destBranch = computeDestinationBranchName(cwd);
 	const { env } = await prepareAskpass(config.localSyncToken);
 
@@ -285,26 +280,32 @@ export async function runLocalSyncRound(cwd: string, opts: RunLocalSyncRoundOpts
 		const fetchResult = await fetchRefspec(destUrl, `+refs/heads/${destBranch}:${REMOTE_TIP_REF}`, cwd, env);
 		const remoteBranchExists = fetchResult.exitCode === 0;
 		const localTip = await getRevOrNull(`refs/heads/${ORPHAN_BRANCH}`, cwd);
-		if (!localTip) {
-			// Orphan branch existed a moment ago (checked above) but its tip is
-			// unresolvable now — treat as nothing-to-sync rather than erroring.
-			return { outcome: "up-to-date", destBranch };
-		}
+		const remoteTip = remoteBranchExists ? await getRevOrNull(REMOTE_TIP_REF, cwd) : null;
 
-		if (!remoteBranchExists) {
+		if (!remoteTip) {
+			// Nothing usable on the destination (branch missing, or fetch
+			// succeeded but the ref didn't resolve).
+			if (!localTip) {
+				// Nothing locally either — truly nothing to sync yet.
+				return { outcome: "up-to-date", destBranch };
+			}
 			if (opts.pullOnly) {
 				return { outcome: "up-to-date", destBranch, localTip, message: "destination branch doesn't exist yet" };
 			}
 			return pushOrphanTip(destUrl, destBranch, cwd, env);
 		}
 
-		const remoteTip = await getRevOrNull(REMOTE_TIP_REF, cwd);
-		if (!remoteTip) {
-			// Fetch succeeded but the ref didn't resolve — treat like "doesn't exist".
-			if (opts.pullOnly) {
-				return { outcome: "up-to-date", destBranch, localTip };
-			}
-			return pushOrphanTip(destUrl, destBranch, cwd, env);
+		if (!localTip) {
+			// Bootstrap: no local orphan branch yet (e.g. a fresh `git clone` on
+			// a new machine, before this project's first commit here), but the
+			// destination already has history for this project. Create the
+			// local orphan branch pointing straight at the remote tip — this is
+			// what makes "clone, then just open the project" work without any
+			// manual command: the very first SessionStart-triggered pull round
+			// populates local history from scratch.
+			await execGit(["update-ref", `refs/heads/${ORPHAN_BRANCH}`, remoteTip], cwd);
+			await saveState(cwd, "pulled", destBranch, remoteTip, remoteTip);
+			return { outcome: "pulled", destBranch, localTip: remoteTip, remoteTip };
 		}
 
 		if (localTip === remoteTip) {
