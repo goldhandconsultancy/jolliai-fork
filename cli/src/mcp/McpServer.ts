@@ -43,6 +43,13 @@ import { resolveClientInfoAgent } from "../core/TelemetryAgent.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { JolliMemoryConfig } from "../Types.js";
 import {
+	runCatalogExpiring,
+	runCatalogFindUsage,
+	runCatalogGet,
+	runCatalogSearch,
+	runCatalogStale,
+} from "./CatalogTools.js";
+import {
 	buildJolliMenu,
 	buildJolliPromptText,
 	JOLLI_PROMPT_ARGUMENT,
@@ -229,6 +236,68 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 			"Report Jolli Memory's installation & configuration health for this repo: which hooks are installed, the active hook runtime, data-migration state, account / API-key configuration, detected AI integrations with their session counts, the stored-memory count, and the orphan branch. This is the environment health check — pair it with queue_status (generation progress), not list_branches (recorded memory).",
 		inputSchema: { type: "object", properties: {} },
 	},
+	{
+		name: "catalog_search",
+		requiresRepo: false,
+		description:
+			"Search the project catalogus (full-text over project name/client). Returns up to 20 matching projects with their IDs — use catalog_get to fetch full details.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				query: { type: "string", description: "Project name, client, or keyword (full-text search)." },
+			},
+			required: ["query"],
+		},
+	},
+	{
+		name: "catalog_get",
+		requiresRepo: false,
+		description:
+			"Fetch full project details from the catalogus: all resources, credentials, integrations, and metadata for a single project ID.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				project_id: { type: "string", description: "Project ID to fetch (exact match required)." },
+			},
+			required: ["project_id"],
+		},
+	},
+	{
+		name: "catalog_find_usage",
+		requiresRepo: false,
+		description:
+			"Find all projects that reference a resource (credential, certificate, secret, service principal, etc.) — use to assess impact of rotating, expiring, or decommissioning a resource.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				resource_name: { type: "string", description: "Resource name (fuzzy-matched, e.g. 'credential Y')." },
+			},
+			required: ["resource_name"],
+		},
+	},
+	{
+		name: "catalog_expiring",
+		requiresRepo: false,
+		description:
+			"List certificates, secrets, and credentials expiring soon (within 30 days by default, soonest first).",
+		inputSchema: {
+			type: "object",
+			properties: {
+				days: { type: "number", description: "Days until expiry to consider (default 30)." },
+			},
+		},
+	},
+	{
+		name: "catalog_stale",
+		requiresRepo: false,
+		description: "List projects with no recent commit activity — candidates for archival or decommission review.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				days: { type: "number", description: "Days since last commit (default 180)." },
+			},
+		},
+	},
 ];
 
 /** Route a validated tool call to its handler. Throws on unknown tool. */
@@ -257,6 +326,16 @@ export async function dispatchTool(cwd: string, name: string, args: Record<strin
 			return runListSpaces(cwd);
 		case "bind_space":
 			return runBindSpace(cwd, args as { space: string });
+		case "catalog_search":
+			return runCatalogSearch(cwd, args as { query: string });
+		case "catalog_get":
+			return runCatalogGet(cwd, args as { project_id: string });
+		case "catalog_find_usage":
+			return runCatalogFindUsage(cwd, args as { resource_name: string });
+		case "catalog_expiring":
+			return runCatalogExpiring(cwd, args as { days?: number });
+		case "catalog_stale":
+			return runCatalogStale(cwd, args as { days?: number });
 		default:
 			throw new Error(`Unknown tool: ${name}`);
 	}

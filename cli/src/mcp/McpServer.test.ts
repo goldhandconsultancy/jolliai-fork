@@ -13,6 +13,14 @@ vi.mock("./McpTools.js", () => ({
 	runBindSpace: vi.fn().mockResolvedValue({ type: "bound", bindingId: 1, jmSpaceId: 1, repoName: "acme" }),
 }));
 
+vi.mock("./CatalogTools.js", () => ({
+	runCatalogSearch: vi.fn().mockResolvedValue({ text: "No results" }),
+	runCatalogGet: vi.fn().mockResolvedValue({ text: "Project details" }),
+	runCatalogFindUsage: vi.fn().mockResolvedValue({ text: "Usage found" }),
+	runCatalogExpiring: vi.fn().mockResolvedValue({ text: "Nothing expiring" }),
+	runCatalogStale: vi.fn().mockResolvedValue({ text: "No stale projects" }),
+}));
+
 // `startMcpServer` withholds every `requiresRepo` tool when the cwd is not inside a git
 // worktree, so any test that expects the full tool set needs this to answer true.
 // Mocked rather than given a real temp repo: these tests pass synthetic paths like
@@ -118,6 +126,13 @@ import { setActiveStorage } from "../core/SummaryStore.js";
 import { track } from "../core/Telemetry.js";
 import { getLogDir, resetLogDir } from "../Logger.js";
 import {
+	runCatalogExpiring,
+	runCatalogFindUsage,
+	runCatalogGet,
+	runCatalogSearch,
+	runCatalogStale,
+} from "./CatalogTools.js";
+import {
 	dispatchTool,
 	isPluginBundleCwd,
 	type PlatformToolClient,
@@ -139,11 +154,22 @@ import {
 	runStatus,
 } from "./McpTools.js";
 
+const NON_REPO_BUILTIN_TOOL_NAMES = TOOL_DEFINITIONS.filter((t) => !t.requiresRepo).map((t) => t.name);
+const NON_REPO_BUILTIN_TOOL_NAMES_SORTED = [...NON_REPO_BUILTIN_TOOL_NAMES].sort();
+const REPO_BUILTIN_TOOL_NAMES_SORTED = TOOL_DEFINITIONS.filter((t) => t.requiresRepo)
+	.map((t) => t.name)
+	.sort();
+
 describe("MCP tool registry", () => {
-	it("declares exactly the ten tools", () => {
+	it("declares exactly the built-in tools", () => {
 		expect(TOOL_DEFINITIONS.map((t) => t.name).sort()).toEqual(
 			[
 				"bind_space",
+				"catalog_expiring",
+				"catalog_find_usage",
+				"catalog_get",
+				"catalog_search",
+				"catalog_stale",
 				"get_decision_timeline",
 				"get_pr_description",
 				"list_branches",
@@ -221,6 +247,31 @@ describe("dispatchTool", () => {
 		expect(runBindSpace).toHaveBeenCalledWith("/repo", { space: "acme" });
 	});
 
+	it("routes catalog_search to runCatalogSearch with parsed args", async () => {
+		await dispatchTool("/repo", "catalog_search", { query: "acme" });
+		expect(runCatalogSearch).toHaveBeenCalledWith("/repo", { query: "acme" });
+	});
+
+	it("routes catalog_get to runCatalogGet with parsed args", async () => {
+		await dispatchTool("/repo", "catalog_get", { project_id: "123" });
+		expect(runCatalogGet).toHaveBeenCalledWith("/repo", { project_id: "123" });
+	});
+
+	it("routes catalog_find_usage to runCatalogFindUsage with parsed args", async () => {
+		await dispatchTool("/repo", "catalog_find_usage", { resource_name: "secret-x" });
+		expect(runCatalogFindUsage).toHaveBeenCalledWith("/repo", { resource_name: "secret-x" });
+	});
+
+	it("routes catalog_expiring to runCatalogExpiring with parsed args", async () => {
+		await dispatchTool("/repo", "catalog_expiring", { days: 30 });
+		expect(runCatalogExpiring).toHaveBeenCalledWith("/repo", { days: 30 });
+	});
+
+	it("routes catalog_stale to runCatalogStale with parsed args", async () => {
+		await dispatchTool("/repo", "catalog_stale", { days: 180 });
+		expect(runCatalogStale).toHaveBeenCalledWith("/repo", { days: 180 });
+	});
+
 	it("throws on an unknown tool", async () => {
 		await expect(dispatchTool("/repo", "nope", {})).rejects.toThrow(/unknown tool/i);
 	});
@@ -284,18 +335,8 @@ describe("startMcpServer", () => {
 			TOOL_DEFINITIONS.filter((t) => t.requiresRepo === requiresRepo)
 				.map((t) => t.name)
 				.sort();
-		expect(partition(false)).toEqual(["list_spaces"]);
-		expect(partition(true)).toEqual([
-			"bind_space",
-			"get_decision_timeline",
-			"get_pr_description",
-			"list_branches",
-			"push_memory",
-			"queue_status",
-			"recall",
-			"search",
-			"status",
-		]);
+		expect(partition(false)).toEqual(NON_REPO_BUILTIN_TOOL_NAMES_SORTED);
+		expect(partition(true)).toEqual(REPO_BUILTIN_TOOL_NAMES_SORTED);
 	});
 
 	it("ListTools handler returns the tool definitions", async () => {
@@ -672,7 +713,7 @@ describe("startMcpServer", () => {
 		expect(connectMock).toHaveBeenCalledTimes(1);
 		const listed = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
 		const names = listed.tools.map((t) => t.name);
-		expect(names).toEqual(["list_spaces"]);
+		expect(names).toEqual(NON_REPO_BUILTIN_TOOL_NAMES);
 		for (const withheld of TOOL_DEFINITIONS.filter((t) => t.requiresRepo)) {
 			expect(names, `${withheld.name} must not be advertised`).not.toContain(withheld.name);
 		}
@@ -714,7 +755,7 @@ describe("startMcpServer", () => {
 		}
 		// Same protection…
 		const listed = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
-		expect(listed.tools.map((t) => t.name)).toEqual(["list_spaces"]);
+		expect(listed.tools.map((t) => t.name)).toEqual(NON_REPO_BUILTIN_TOOL_NAMES);
 		// …different explanation.
 		expect(written).toContain("`git` could not be executed");
 		expect(written).toContain("stripped PATH");
@@ -738,7 +779,7 @@ describe("startMcpServer", () => {
 			stderr.mockRestore();
 		}
 		const listed = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
-		expect(listed.tools.map((t) => t.name)).toEqual(["list_spaces"]);
+		expect(listed.tools.map((t) => t.name)).toEqual(NON_REPO_BUILTIN_TOOL_NAMES);
 	});
 
 	// Backstop for a client working from a cached tools/list. Without it the call
@@ -850,7 +891,7 @@ describe("startMcpServer — platform tools", () => {
 		vi.mocked(runSearch).mockClear();
 	});
 
-	it("explicit opt-out: advertises exactly 10 tools and never constructs a client", async () => {
+	it("explicit opt-out: advertises exactly the built-in tools and never constructs a client", async () => {
 		const createPlatformClient = vi.fn();
 		await startMcpServer("/repo", {
 			loadConfig: async () => ({ mcpPlatformToolsEnabled: false }),
@@ -858,7 +899,7 @@ describe("startMcpServer — platform tools", () => {
 		});
 		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
 		expect(list.tools.map((t) => t.name)).toEqual(TOOL_DEFINITIONS.map((t) => t.name));
-		expect(list.tools).toHaveLength(10);
+		expect(list.tools).toHaveLength(TOOL_DEFINITIONS.length);
 		expect(createPlatformClient).not.toHaveBeenCalled();
 		// A built-in still dispatches through the local table.
 		await capturedHandlers[1]({ params: { name: "search", arguments: { query: "x" } } });
@@ -870,7 +911,7 @@ describe("startMcpServer — platform tools", () => {
 		await startMcpServer("/repo", { loadConfig: async () => ({}), createPlatformClient });
 		expect(createPlatformClient).toHaveBeenCalledTimes(1);
 		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
-		expect(list.tools).toHaveLength(11);
+		expect(list.tools).toHaveLength(TOOL_DEFINITIONS.length + 1);
 		expect(list.tools.map((t) => t.name)).toContain("create_ticket");
 	});
 
@@ -880,7 +921,7 @@ describe("startMcpServer — platform tools", () => {
 			createPlatformClient: () => stubClient([platA, platB]),
 		});
 		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
-		expect(list.tools).toHaveLength(12);
+		expect(list.tools).toHaveLength(TOOL_DEFINITIONS.length + 2);
 		expect(list.tools.map((t) => t.name)).toEqual(
 			expect.arrayContaining(["create_ticket", "list_projects", "search"]),
 		);
@@ -967,14 +1008,14 @@ describe("startMcpServer — platform tools", () => {
 		expect(JSON.parse(result.content[0].text)).toEqual({ error: "relay failed" });
 	});
 
-	it("enabled but empty/failed manifest: falls back to exactly the 10 built-ins and still connects", async () => {
+	it("enabled but empty/failed manifest: falls back to exactly the built-ins and still connects", async () => {
 		await startMcpServer("/repo", {
 			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
 			createPlatformClient: () => stubClient([]),
 		});
 		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
 		expect(list.tools.map((t) => t.name)).toEqual(TOOL_DEFINITIONS.map((t) => t.name));
-		expect(list.tools).toHaveLength(10);
+		expect(list.tools).toHaveLength(TOOL_DEFINITIONS.length);
 		expect(connectMock).toHaveBeenCalledTimes(1);
 	});
 
@@ -989,7 +1030,7 @@ describe("startMcpServer — platform tools", () => {
 			createPlatformClient: () => stubClient([collide, platA]),
 		});
 		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
-		expect(list.tools).toHaveLength(11);
+		expect(list.tools).toHaveLength(TOOL_DEFINITIONS.length + 1);
 		expect(list.tools.filter((t) => t.name === "search")).toHaveLength(1);
 		// "search" hits the built-in handler, not the generic executor.
 		await capturedHandlers[1]({ params: { name: "search", arguments: { query: "x" } } });
@@ -1014,8 +1055,8 @@ describe("startMcpServer — platform tools", () => {
 			createPlatformClient: () => stubClient([first, second]),
 		});
 		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: { name: string }[] };
-		// Exactly one create_ticket advertised (10 built-ins + 1) — no duplicate in tools/list.
-		expect(list.tools).toHaveLength(11);
+		// Exactly one create_ticket advertised (built-ins + 1) — no duplicate in tools/list.
+		expect(list.tools).toHaveLength(TOOL_DEFINITIONS.length + 1);
 		expect(list.tools.filter((t) => t.name === "create_ticket")).toHaveLength(1);
 		// tools/call runs the FIRST entry, matching what a client sees in tools/list.
 		await capturedHandlers[1]({ params: { name: "create_ticket", arguments: {} } });
@@ -1027,7 +1068,7 @@ describe("startMcpServer — platform tools", () => {
 		await startMcpServer("/repo", { loadConfig: async () => ({ mcpPlatformToolsEnabled: true }) });
 		const list = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: unknown[] };
 		expect(fetchManifestMock).toHaveBeenCalled();
-		expect(list.tools).toHaveLength(11);
+		expect(list.tools).toHaveLength(TOOL_DEFINITIONS.length + 1);
 	});
 
 	// --- /jolli menu prompt ---
@@ -1213,7 +1254,7 @@ describe("platformDegraded / rebuildPlatformHalf", () => {
 			stderr.mockRestore();
 		}
 		expect(degraded?.insideRepo).toBe(false);
-		expect(degraded?.toolDefinitions.map((t) => t.name)).toEqual(["list_spaces"]);
+		expect(degraded?.toolDefinitions.map((t) => t.name)).toEqual(NON_REPO_BUILTIN_TOOL_NAMES);
 
 		const recovered = await rebuildPlatformHalf(degraded as NonNullable<typeof degraded>, {
 			loadConfig: async () => ({ mcpPlatformToolsEnabled: true }),
