@@ -1945,18 +1945,18 @@ export interface CommitCatalog {
  */
 export type LlmConfig = Pick<
 	JolliMemoryConfig,
-	"apiKey" |
-		"model" |
-		"jolliApiKey" |
-		"aiProvider" |
-		"azureEndpoint" |
-		"azureApiKey" |
-		"azureDeployment" |
-		"azureApiVersion" |
-		"localAgentTool" |
-		"localAgentPath" |
-		"localAgentModel" |
-		"summaryLanguage"
+	| "apiKey"
+	| "model"
+	| "jolliApiKey"
+	| "aiProvider"
+	| "azureEndpoint"
+	| "azureApiKey"
+	| "azureDeployment"
+	| "azureApiVersion"
+	| "localAgentTool"
+	| "localAgentPath"
+	| "localAgentModel"
+	| "summaryLanguage"
 >;
 
 /** Configuration stored in .jolli/jollimemory/config.json */

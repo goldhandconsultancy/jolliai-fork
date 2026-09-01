@@ -117,6 +117,8 @@ export interface BackfillOptions {
 	readonly projectsRoot?: string;
 	/** Progress callback fired after each commit is processed. */
 	readonly onProgress?: (done: number, total: number, outcome: BackfillOutcome) => void;
+	/** Reserved flag for explicit re-generation flows wired at the command layer. */
+	readonly force?: boolean;
 	/**
 	 * Fired right BEFORE a commit's summary is generated (before its LLM call),
 	 * unlike `onProgress` which fires after. Lets a UI show "now working on commit

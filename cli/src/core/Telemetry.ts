@@ -32,6 +32,9 @@ import { isTelemetryEventName, type TelemetryEventName } from "./TelemetryEvents
 /** Envelope schema version — bump only on a breaking envelope-shape change. */
 export const SCHEMA_VERSION = 1;
 
+/** GoldJolli fork policy switch: hard-disable telemetry emission client-side. */
+export const TELEMETRY_HARD_DISABLED = false;
+
 export type TelemetryEnv = "local" | "dev" | "preview" | "prod" | "sandbox" | "unknown";
 
 /** Count buckets (JOLLI-1786 §7.D) — never ship a raw count that could fingerprint. */
@@ -184,6 +187,7 @@ function emit(
 	properties: Readonly<Record<string, unknown>>,
 	surfaceOverride: string | undefined,
 ): void {
+	if (TELEMETRY_HARD_DISABLED) return;
 	const ctx = context;
 	if (!ctx || !ctx.enabled) return;
 	if (!isTelemetryEventName(eventName)) return;

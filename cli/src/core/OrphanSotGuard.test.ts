@@ -92,6 +92,10 @@ const BRANCH_NAME_ALLOWLIST: ReadonlyMap<string, string> = new Map([
 		"cli/src/commands/DoctorCommand.ts",
 		"names the branch in the informational row beside the system-of-record check",
 	],
+	[
+		"cli/src/localsync/LocalSyncEngine.ts",
+		"merges and pushes the orphan-branch mirror to a fork-local sync branch by design",
+	],
 	["vscode/src/Extension.ts", "watches the orphan ref AND the database — either side of the fence pushes a refresh"],
 	[
 		"vscode/src/JolliMemoryBridge.ts",

@@ -186,7 +186,7 @@ describe("scanCopilotChatSessions", () => {
 	it("Scan A: maxAgeMs:Infinity accepts a session far older than 48h (back-fill override)", async () => {
 		makeSessionStateEntry({ sid: "s-ancient", folderPath: projectDir, ageHours: 24 * 90 });
 		const { scanCopilotChatSessions } = await import("./CopilotChatSessionDiscoverer.js");
-		const result = await scanCopilotChatSessions(projectDir, { maxAgeMs: Number.POSITIVE_INFINITY });
+		const result = await scanCopilotChatSessions(projectDir, Number.POSITIVE_INFINITY);
 		expect(result.sessions).toHaveLength(1);
 		expect(result.sessions[0].sessionId).toBe("s-ancient");
 	});
@@ -238,7 +238,7 @@ describe("scanCopilotChatSessions", () => {
 		const ws = makeWorkspace("ws1", nativePathToFileUri(projectDir));
 		makeChatSessionsFile(ws, "ancient.jsonl", 24 * 90);
 		const { scanCopilotChatSessions } = await import("./CopilotChatSessionDiscoverer.js");
-		const result = await scanCopilotChatSessions(projectDir, { maxAgeMs: Number.POSITIVE_INFINITY });
+		const result = await scanCopilotChatSessions(projectDir, Number.POSITIVE_INFINITY);
 		expect(result.sessions).toHaveLength(1);
 		expect(result.sessions[0].sessionId).toBe("ancient");
 	});

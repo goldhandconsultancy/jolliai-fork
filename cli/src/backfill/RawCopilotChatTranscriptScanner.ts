@@ -57,7 +57,7 @@ export async function scanCopilotChatTranscriptsForBackfill(
 	const bySession = new Map<string, RawEntry[]>();
 
 	for (const root of roots) {
-		const { sessions, error } = await scanCopilotChatSessions(root, { maxAgeMs: Number.POSITIVE_INFINITY });
+		const { sessions, error } = await scanCopilotChatSessions(root, Number.POSITIVE_INFINITY);
 		if (error) {
 			log.warn("Copilot Chat scan error (%s) for %s — sessions excluded: %s", error.kind, root, error.message);
 		}

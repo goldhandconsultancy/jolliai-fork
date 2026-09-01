@@ -244,7 +244,7 @@ export interface StatusResult {
 		 * so a caller must not report "no credential → memory generation disabled"
 		 * when this is `"local-agent"`. A plain enum, never key-derived.
 		 */
-		readonly aiProvider: "anthropic" | "jolli" | "local-agent" | null;
+		readonly aiProvider: "anthropic" | "jolli" | "local-agent" | "azure-foundry" | null;
 		/**
 		 * Human-readable label of the local agent CLI driving generation (e.g.
 		 * "Claude Code", "Codex"). Surfaced ONLY when `aiProvider === "local-agent"`;
@@ -293,7 +293,7 @@ export interface StatusAccountInput {
 	readonly jolliApiKeyConfigured: boolean;
 	readonly anthropicKeyConfigured: boolean;
 	/** Explicit `aiProvider` choice, or null when unset. A plain enum, not secret material. */
-	readonly aiProvider: "anthropic" | "jolli" | "local-agent" | null;
+	readonly aiProvider: "anthropic" | "jolli" | "local-agent" | "azure-foundry" | null;
 	/** Configured local agent CLI id, or null when unset (defaults to "claude-code"). Only meaningful when `aiProvider === "local-agent"`. */
 	readonly localAgentTool: LocalAgentToolId | null;
 	/** Full persisted `jolliUrl` (with protocol) or null. Never derived from the API key. */

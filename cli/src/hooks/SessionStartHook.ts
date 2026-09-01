@@ -39,7 +39,7 @@ import { isLocalAgentAuthError } from "../core/SummaryErrorMarker.js";
 import { getDisplayDate } from "../core/SummaryFormat.js";
 import { getIndex } from "../core/SummaryStore.js";
 import { collectAllTopics } from "../core/SummaryTree.js";
-import { createLogger, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
+import { createLogger, setLogDir } from "../Logger.js";
 import { spawnLocalSyncWorkerDetached } from "../localsync/LocalSyncWorker.js";
 import type {
 	CommitSummary,

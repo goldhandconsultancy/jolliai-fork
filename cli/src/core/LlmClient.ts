@@ -89,6 +89,9 @@ function formatCause(cause: unknown): string {
  */
 const LLM_PROXY_PATH = "/api/push/llm/complete";
 
+const DEFAULT_AZURE_API_VERSION = "2024-06-01";
+const AZURE_CREDENTIAL_ERROR = "Azure Foundry mode requires azureEndpoint, azureApiKey, and azureDeployment";
+
 /**
  * End-to-end timeout for proxy LLM calls (covers connect + headers + body).
  *
@@ -202,6 +205,8 @@ interface LlmCredentials {
 	readonly apiKey?: string;
 	/** Model alias or full ID (e.g. "haiku", "sonnet") */
 	readonly model?: string;
+	/** Preferred summary language injected as a directive when set. */
+	readonly summaryLanguage?: string;
 	/** Jolli Space API key for proxy mode (sk-jol-...) */
 	readonly jolliApiKey?: string;
 	/**
@@ -214,7 +219,15 @@ interface LlmCredentials {
 	 * Optional — legacy configs without this field fall through to the
 	 * credential-presence precedence below.
 	 */
-	readonly aiProvider?: "anthropic" | "jolli" | "local-agent";
+	readonly aiProvider?: "anthropic" | "jolli" | "local-agent" | "azure-foundry";
+	/** Azure AI Foundry / Azure OpenAI endpoint, e.g. https://<resource>.openai.azure.com */
+	readonly azureEndpoint?: string;
+	/** Azure AI Foundry / Azure OpenAI API key */
+	readonly azureApiKey?: string;
+	/** Azure deployment name for chat completions */
+	readonly azureDeployment?: string;
+	/** Optional Azure API version override */
+	readonly azureApiVersion?: string;
 	/** Which local agent tool to drive when aiProvider === "local-agent". */
 	readonly localAgentTool?: LocalAgentToolId;
 	/** Optional explicit path to the local agent binary, overriding PATH discovery. */
@@ -245,7 +258,10 @@ interface LlmCredentials {
  *      only the explicit choice above can pick it.
  */
 export function resolveLlmCredentialSource(
-	credentials: Pick<LlmCredentials, "apiKey" | "jolliApiKey" | "aiProvider">,
+	credentials: Pick<
+		LlmCredentials,
+		"apiKey" | "jolliApiKey" | "aiProvider" | "azureEndpoint" | "azureApiKey" | "azureDeployment"
+	>,
 ): LlmCredentialSource | null {
 	if (credentials.aiProvider === "local-agent") {
 		// The local agent uses the tool's own login (subscription OAuth); no
@@ -260,7 +276,13 @@ export function resolveLlmCredentialSource(
 		if (process.env.ANTHROPIC_API_KEY) return "anthropic-env";
 		return null;
 	}
+	if (credentials.aiProvider === "azure-foundry") {
+		return credentials.azureEndpoint && credentials.azureApiKey && credentials.azureDeployment
+			? "azure-foundry"
+			: null;
+	}
 	if (credentials.apiKey) return "anthropic-config";
+	if (credentials.azureEndpoint && credentials.azureApiKey && credentials.azureDeployment) return "azure-foundry";
 	if (process.env.ANTHROPIC_API_KEY) return "anthropic-env";
 	if (credentials.jolliApiKey) return "jolli-proxy";
 	return null;
@@ -269,7 +291,17 @@ export function resolveLlmCredentialSource(
 /** The credential-carrying fields callLlm needs to select and drive a provider. */
 type LlmCredentialFields = Pick<
 	LlmCredentials,
-	"apiKey" | "jolliApiKey" | "aiProvider" | "localAgentTool" | "localAgentPath" | "localAgentModel"
+	| "apiKey"
+	| "jolliApiKey"
+	| "aiProvider"
+	| "azureEndpoint"
+	| "azureApiKey"
+	| "azureDeployment"
+	| "azureApiVersion"
+	| "localAgentTool"
+	| "localAgentPath"
+	| "localAgentModel"
+	| "summaryLanguage"
 >;
 
 /**
@@ -286,9 +318,29 @@ export function llmCredentials(config: LlmCredentialFields): LlmCredentialFields
 		apiKey: config.apiKey,
 		jolliApiKey: config.jolliApiKey,
 		aiProvider: config.aiProvider,
+		azureEndpoint: config.azureEndpoint,
+		azureApiKey: config.azureApiKey,
+		azureDeployment: config.azureDeployment,
+		azureApiVersion: config.azureApiVersion,
 		localAgentTool: config.localAgentTool,
 		localAgentPath: config.localAgentPath,
 		localAgentModel: config.localAgentModel,
+		summaryLanguage: config.summaryLanguage,
+	};
+}
+
+function resolvePromptParams(
+	template: string,
+	options: Pick<LlmCallOptions, "params" | "summaryLanguage">,
+): Record<string, string> {
+	if (!template.includes("{{languageDirective}}")) return options.params;
+	const trimmed = options.summaryLanguage?.trim();
+	const languageDirective = trimmed
+		? `LANGUAGE: Write all reader-facing prose content of your response in ${trimmed}.`
+		: "";
+	return {
+		...options.params,
+		languageDirective,
 	};
 }
 
@@ -415,6 +467,8 @@ export async function callLlm(options: LlmCallOptions): Promise<LlmCallResult> {
 		}
 		case "local-agent":
 			return callLocalAgent(options, source);
+		case "azure-foundry":
+			return callAzure(options, source);
 		default:
 			throw new LlmCredentialError();
 	}
@@ -631,11 +685,12 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 	if (!entry) {
 		throw new Error(`Unknown LLM action: "${options.action}". Available: ${[...TEMPLATES.keys()].join(", ")}`);
 	}
-	const missing = findUnfilledPlaceholders(entry.template, options.params);
+	const params = resolvePromptParams(entry.template, options);
+	const missing = findUnfilledPlaceholders(entry.template, params);
 	if (missing.length > 0) {
 		log.warn("Local-agent call has unfilled placeholders for action=%s: %s", options.action, missing.join(", "));
 	}
-	const prompt = fillTemplate(entry.template, options.params);
+	const prompt = fillTemplate(entry.template, params);
 	// NOTE: options.maxTokens is intentionally NOT threaded here — the Claude
 	// Code CLI has no per-call output-token cap flag, so the API path's
 	// max_tokens budget (and the resulting `stopReason === "max_tokens"`
@@ -881,11 +936,12 @@ async function callDirect(
 	if (!entry) {
 		throw new Error(`Unknown LLM action: "${options.action}". Available: ${[...TEMPLATES.keys()].join(", ")}`);
 	}
-	const missing = findUnfilledPlaceholders(entry.template, options.params);
+	const params = resolvePromptParams(entry.template, options);
+	const missing = findUnfilledPlaceholders(entry.template, params);
 	if (missing.length > 0) {
 		log.warn("Direct LLM call has unfilled placeholders for action=%s: %s", options.action, missing.join(", "));
 	}
-	const prompt = fillTemplate(entry.template, options.params);
+	const prompt = fillTemplate(entry.template, params);
 
 	const model = resolveModelId(options.model);
 	const maxTokens = options.maxTokens ?? 8192;
@@ -1062,6 +1118,108 @@ async function callDirect(
 		cachedTokens: (response.usage.cache_read_input_tokens ?? 0) + (response.usage.cache_creation_input_tokens ?? 0),
 		apiLatencyMs: elapsed,
 		stopReason: response.stop_reason,
+		source,
+	};
+}
+
+async function callAzure(options: LlmCallOptions, source: LlmCredentialSource): Promise<LlmCallResult> {
+	const { azureEndpoint, azureApiKey, azureDeployment } = options;
+	if (!azureEndpoint || !azureApiKey || !azureDeployment) {
+		throw new Error(AZURE_CREDENTIAL_ERROR);
+	}
+
+	const entry = TEMPLATES.get(options.action);
+	if (!entry) {
+		throw new Error(`Unknown LLM action: "${options.action}". Available: ${[...TEMPLATES.keys()].join(", ")}`);
+	}
+	const params = resolvePromptParams(entry.template, options);
+	const missing = findUnfilledPlaceholders(entry.template, params);
+	if (missing.length > 0) {
+		log.warn("Azure Foundry call has unfilled placeholders for action=%s: %s", options.action, missing.join(", "));
+	}
+	const prompt = fillTemplate(entry.template, params);
+
+	const trimmedEndpoint = azureEndpoint.trim().replace(/\/+$/, "");
+	const isGatewayUrl = /\/chat\/completions$/i.test(trimmedEndpoint);
+	const requestUrl = isGatewayUrl
+		? (() => {
+				if (!options.azureApiVersion) return trimmedEndpoint;
+				const url = new URL(trimmedEndpoint);
+				url.searchParams.set("api-version", options.azureApiVersion);
+				return url.toString();
+			})()
+		: `${trimmedEndpoint}/openai/deployments/${encodeURIComponent(azureDeployment)}/chat/completions?api-version=${encodeURIComponent(options.azureApiVersion ?? DEFAULT_AZURE_API_VERSION)}`;
+
+	const body = JSON.stringify({
+		temperature: 0,
+		max_completion_tokens: options.maxTokens ?? 8192,
+		messages: [{ role: "user", content: prompt }],
+		...(isGatewayUrl ? { model: azureDeployment } : {}),
+	});
+
+	const startTime = Date.now();
+	let response: Response;
+	try {
+		response = await fetch(requestUrl, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"api-key": azureApiKey,
+			},
+			body,
+			signal: AbortSignal.timeout(options.timeoutMs ?? DIRECT_FETCH_TIMEOUT_MS),
+		});
+	} catch (err) {
+		const elapsedMs = Date.now() - startTime;
+		const message = err instanceof Error ? err.message : String(err);
+		const cause = err instanceof Error ? formatCause((err as { cause?: unknown }).cause) : "(non-error)";
+		log.error(
+			"Azure Foundry LLM fetch failed: action=%s url=%s elapsedMs=%d bodyChars=%d error=%s cause=%s",
+			options.action,
+			requestUrl,
+			elapsedMs,
+			body.length,
+			message,
+			cause,
+		);
+		throw err;
+	}
+
+	if (!response.ok) {
+		const errorBody = await response.text();
+		throw new Error(`Azure Foundry request failed with status ${response.status}: ${errorBody.substring(0, 200)}`);
+	}
+
+	const result = (await response.json()) as {
+		readonly choices?: ReadonlyArray<{
+			readonly message?: { readonly content?: string | ReadonlyArray<{ readonly text?: string }> };
+			readonly finish_reason?: string | null;
+		}>;
+		readonly usage?: { readonly prompt_tokens?: number; readonly completion_tokens?: number };
+		readonly model?: string;
+	};
+
+	const choice = result.choices?.[0];
+	const content = choice?.message?.content;
+	const text =
+		typeof content === "string"
+			? content
+			: Array.isArray(content)
+				? content.map((part) => (typeof part?.text === "string" ? part.text : "")).join("\n")
+				: "";
+	const trimmedText = text.trim();
+	if (!trimmedText) {
+		throw new Error("No text content in Azure Foundry response");
+	}
+
+	return {
+		text: trimmedText,
+		model: result.model,
+		inputTokens: result.usage?.prompt_tokens ?? 0,
+		outputTokens: result.usage?.completion_tokens ?? 0,
+		cachedTokens: 0,
+		apiLatencyMs: Date.now() - startTime,
+		stopReason: choice?.finish_reason ?? null,
 		source,
 	};
 }

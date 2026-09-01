@@ -22,6 +22,7 @@ import {
  * an actual buffered `command_invoked` event are skipped rather than deleted.
  */
 const itUnlessHardDisabled = TELEMETRY_HARD_DISABLED ? it.skip : it;
+const itIfHardDisabled = TELEMETRY_HARD_DISABLED ? it : it.skip;
 
 let cwd: string;
 
@@ -155,8 +156,7 @@ describe("installCommandTelemetryHooks", () => {
 		expect(await readTelemetryEvents(cwd)).toEqual([]);
 	});
 
-	it("emits nothing for a successful top-level command under TELEMETRY_HARD_DISABLED", async () => {
-		expect(TELEMETRY_HARD_DISABLED).toBe(true);
+	itIfHardDisabled("emits nothing for a successful top-level command under TELEMETRY_HARD_DISABLED", async () => {
 		const program = programWith(() => {});
 		await program.parseAsync(["node", "jolli", "recall"]);
 		expect(await readTelemetryEvents(cwd)).toEqual([]);

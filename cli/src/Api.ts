@@ -53,7 +53,6 @@ import {
 	parseBaseUrl as _parseBaseUrl,
 	parseJolliApiKey as _parseJolliApiKey,
 } from "./core/JolliApiUtils.js";
-import { installCommandTelemetryHooks } from "./core/TelemetryCommandHook.js";
 import { CLI_PACKAGE_NAME, REFRESH_COMMAND, refreshUpdateCache } from "./core/UpdateCheck.js";
 import { autoRefreshSkillsIfStale } from "./install/SkillAutoRefresh.js";
 import type { Logger } from "./Logger.js";
