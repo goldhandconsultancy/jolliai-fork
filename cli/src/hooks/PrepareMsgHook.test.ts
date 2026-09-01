@@ -4,7 +4,10 @@ const mockReadManualDisableFlag = vi.hoisted(() => vi.fn().mockResolvedValue(fal
 
 // Mock fs/promises so we can control readFile results without touching disk
 vi.mock("node:fs/promises", () => ({
+	access: vi.fn(),
+	mkdir: vi.fn(),
 	readFile: vi.fn(),
+	writeFile: vi.fn(),
 }));
 
 vi.mock("../core/SessionTracker.js", () => ({
@@ -31,7 +34,7 @@ vi.spyOn(console, "log").mockImplementation(() => {});
 vi.spyOn(console, "warn").mockImplementation(() => {});
 vi.spyOn(console, "error").mockImplementation(() => {});
 
-import { readFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { getCommitRange, getHeadHash, getLastReflogAction, isAncestor, readOrigHead } from "../core/GitOps.js";
 import { loadSquashPending, saveSquashPending } from "../core/SessionTracker.js";
 import { handlePrepareMsgHook, parseSquashMsg } from "./PrepareMsgHook.js";
@@ -106,6 +109,51 @@ describe("handlePrepareMsgHook", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		mockReadManualDisableFlag.mockResolvedValue(false);
+		vi.mocked(access).mockResolvedValue(undefined);
+		vi.mocked(mkdir).mockResolvedValue(undefined);
+		vi.mocked(writeFile).mockResolvedValue(undefined);
+		delete process.env.JOLLI_REQUIRED_PROJECT_DOCS;
+		delete process.env.JOLLI_AUTO_CREATE_PROJECT_DOCS;
+	});
+
+	it("warns and auto-creates missing required docs with placeholders by default", async () => {
+		process.env.JOLLI_REQUIRED_PROJECT_DOCS = "docs/project.md, docs/architecture.md";
+		const missing = Object.assign(new Error("missing"), { code: "ENOENT" }) as NodeJS.ErrnoException;
+		vi.mocked(access).mockRejectedValue(missing);
+		const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+
+		await handlePrepareMsgHook("message", "/test/project");
+
+		expect(mkdir).toHaveBeenCalledTimes(2);
+		expect(writeFile).toHaveBeenCalledTimes(2);
+		expect(writeFile).toHaveBeenNthCalledWith(
+			1,
+			expect.stringContaining("docs/project.md"),
+			expect.stringContaining("## Wat Moet Hier In"),
+			expect.objectContaining({ flag: "wx" }),
+		);
+		const output = stderrSpy.mock.calls.map((call) => String(call[0])).join("");
+		expect(output).toContain("projectdocumentatie-check");
+		expect(output).toContain("Automatisch aangemaakt met placeholders");
+		expect(output).toContain("docs/project.md");
+		expect(output).toContain("docs/architecture.md");
+		expect(output).toContain("AI/agent tip");
+	});
+
+	it("warns without auto-creating when JOLLI_AUTO_CREATE_PROJECT_DOCS is disabled", async () => {
+		process.env.JOLLI_REQUIRED_PROJECT_DOCS = "docs/project.md";
+		process.env.JOLLI_AUTO_CREATE_PROJECT_DOCS = "false";
+		const missing = Object.assign(new Error("missing"), { code: "ENOENT" }) as NodeJS.ErrnoException;
+		vi.mocked(access).mockRejectedValue(missing);
+		const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+
+		await handlePrepareMsgHook("message", "/test/project");
+
+		expect(mkdir).not.toHaveBeenCalled();
+		expect(writeFile).not.toHaveBeenCalled();
+		const output = stderrSpy.mock.calls.map((call) => String(call[0])).join("");
+		expect(output).toContain("Ontbreekt nog");
+		expect(output).toContain('touch "docs/project.md"');
 	});
 
 	it("does not write squash state while the repo is manually disabled", async () => {

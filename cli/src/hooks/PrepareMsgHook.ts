@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+
 /**
  * PrepareMsgHook — Git prepare-commit-msg Event Handler
  *
@@ -36,8 +37,9 @@
  *   ...
  */
 
-import { readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { constants as fsConstants } from "node:fs";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getHeadHash } from "../core/GitOps.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
@@ -46,6 +48,120 @@ import { createLogger, setLogDir } from "../Logger.js";
 import { detectResetSquash, resolveGitDir } from "./GitOperationDetector.js";
 
 const log = createLogger("PrepareMsgHook");
+
+const REQUIRED_PROJECT_DOCS_ENV = "JOLLI_REQUIRED_PROJECT_DOCS";
+const AUTO_CREATE_PROJECT_DOCS_ENV = "JOLLI_AUTO_CREATE_PROJECT_DOCS";
+
+function isTruthyEnv(name: string, defaultValue: boolean): boolean {
+	const raw = process.env[name];
+	if (raw == null) return defaultValue;
+	const normalized = raw.trim().toLowerCase();
+	if (normalized.length === 0) return defaultValue;
+	return !["0", "false", "no", "off"].includes(normalized);
+}
+
+function requiredProjectDocsFromEnv(): ReadonlyArray<string> {
+	const raw = process.env[REQUIRED_PROJECT_DOCS_ENV];
+	if (!raw) return [];
+	return raw
+		.split(",")
+		.map((entry) => entry.trim())
+		.filter((entry) => entry.length > 0);
+}
+
+async function missingProjectDocs(cwd: string, requiredDocs: ReadonlyArray<string>): Promise<ReadonlyArray<string>> {
+	const missing: string[] = [];
+	for (const docPath of requiredDocs) {
+		try {
+			await access(resolve(cwd, docPath), fsConstants.F_OK);
+		} catch {
+			missing.push(docPath);
+		}
+	}
+	return missing;
+}
+
+function placeholderTitle(docPath: string): string {
+	const stem = basename(docPath).replace(/\.[^/.]+$/u, "");
+	return stem
+		.split(/[-_\s]+/u)
+		.filter((part) => part.length > 0)
+		.map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+		.join(" ");
+}
+
+function placeholderContent(docPath: string): string {
+	const title = placeholderTitle(docPath) || "Project Documentatie";
+	return `# ${title}
+
+## Doel
+- TODO: Beschrijf het doel van dit document.
+
+## Context
+- TODO: Welke context/achtergrond is relevant voor dit projectonderdeel?
+
+## Wat Moet Hier In
+- TODO: Voeg de kerninformatie toe die teamleden nodig hebben.
+- TODO: Link naar relevante codepaden, services en owners.
+
+## Beslissingen
+- [ ] TODO: Leg genomen of open beslissingen vast.
+
+## Acties
+- [ ] TODO: Concrete vervolgstappen met eigenaar en datum.
+`;
+}
+
+async function createMissingProjectDocs(
+	cwd: string,
+	missingDocs: ReadonlyArray<string>,
+): Promise<ReadonlyArray<string>> {
+	const created: string[] = [];
+	for (const docPath of missingDocs) {
+		const absolutePath = resolve(cwd, docPath);
+		try {
+			await mkdir(dirname(absolutePath), { recursive: true });
+			await writeFile(absolutePath, placeholderContent(docPath), { encoding: "utf-8", flag: "wx" });
+			created.push(docPath);
+		} catch (error: unknown) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+			log.warn("Could not auto-create missing project doc %s: %s", docPath, (error as Error).message);
+		}
+	}
+	return created;
+}
+
+async function warnForMissingProjectDocs(cwd: string): Promise<void> {
+	const requiredDocs = requiredProjectDocsFromEnv();
+	if (requiredDocs.length === 0) return;
+	const initialMissing = await missingProjectDocs(cwd, requiredDocs);
+	if (initialMissing.length === 0) return;
+
+	const autoCreate = isTruthyEnv(AUTO_CREATE_PROJECT_DOCS_ENV, true);
+	const created = autoCreate ? await createMissingProjectDocs(cwd, initialMissing) : [];
+	const missing = autoCreate ? await missingProjectDocs(cwd, requiredDocs) : initialMissing;
+	if (missing.length === 0 && created.length === 0) return;
+
+	const lines = ["jollimemory: projectdocumentatie-check:"];
+
+	if (missing.length > 0) {
+		lines.push("Ontbreekt nog:", ...missing.map((entry) => `  - ${entry}`), "");
+	}
+
+	if (created.length > 0) {
+		lines.push("Automatisch aangemaakt met placeholders:", ...created.map((entry) => `  - ${entry}`), "");
+	}
+
+	lines.push("AI/agent tip: vul deze placeholders meteen aan in dezelfde commit.");
+	if (missing.length > 0) {
+		lines.push(
+			"",
+			"Zullen we dit aanmaken of bijwerken? Start met:",
+			...missing.map((entry) => `  touch "${entry}"`),
+		);
+	}
+	process.stderr.write(`${lines.join("\n")}\n`);
+}
 
 /**
  * Main handler for the prepare-commit-msg hook.
@@ -62,6 +178,8 @@ export async function handlePrepareMsgHook(source: string | undefined, cwd: stri
 		log.info("Repository is manually disabled — skipping squash detection");
 		return;
 	}
+
+	await warnForMissingProjectDocs(cwd);
 
 	// Note: Amend detection has been removed from prepare-commit-msg.
 	// It is now handled by post-commit (reflog detection) and post-rewrite (stdin mapping).
