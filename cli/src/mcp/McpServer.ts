@@ -290,6 +290,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "catalog_search",
+		readOnly: true,
 		requiresRepo: false,
 		description:
 			"Search the project catalogus (full-text over project name/client). Returns up to 20 matching projects with their IDs — use catalog_get to fetch full details.",
@@ -303,6 +304,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "catalog_get",
+		readOnly: true,
 		requiresRepo: false,
 		description:
 			"Fetch full project details from the catalogus: all resources, credentials, integrations, and metadata for a single project ID.",
@@ -316,6 +318,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "catalog_find_usage",
+		readOnly: true,
 		requiresRepo: false,
 		description:
 			"Find all projects that reference a resource (credential, certificate, secret, service principal, etc.) — use to assess impact of rotating, expiring, or decommissioning a resource.",
@@ -329,6 +332,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "catalog_expiring",
+		readOnly: true,
 		requiresRepo: false,
 		description:
 			"List certificates, secrets, and credentials expiring soon (within 30 days by default, soonest first).",
@@ -341,6 +345,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "catalog_stale",
+		readOnly: true,
 		requiresRepo: false,
 		description: "List projects with no recent commit activity — candidates for archival or decommission review.",
 		inputSchema: {
